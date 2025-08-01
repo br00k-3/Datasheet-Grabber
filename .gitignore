@@ -1,2 +1,35 @@
-/datasheets
-/parts_list.txt
+# Downloaded files
+datasheets/
+parts_list.csv
+
+# API Keys - NEVER commit these!
+api_keys.json
+
+# Process lock file
+script.lock
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temporary files
+*.tmp
+*.temp
