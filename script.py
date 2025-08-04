@@ -13,6 +13,7 @@ import atexit
 import socket
 import fcntl
 import re
+import queue
 from urllib.parse import quote
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -40,17 +41,6 @@ def load_api_keys():
             return config.get('api_keys', [])
     except FileNotFoundError:
         print("❌ api_keys.json not found!")
-        print("📝 Please create api_keys.json with your DigiKey API credentials:")
-        print("""
-{
-  "api_keys": [
-    {
-      "CLIENT_ID": "your_client_id_here",
-      "CLIENT_SECRET": "your_client_secret_here"
-    }
-  ]
-}
-        """)
         return []
     except Exception as e:
         print(f"❌ Error loading API keys: {e}")
@@ -61,8 +51,7 @@ API_KEYS = load_api_keys()
 
 # Validate API keys are available
 if not API_KEYS:
-    print("❌ No API keys available - script will not function!")
-    print("📝 Please configure api_keys.json first")
+    print("❌ No API keys available")
     exit(1)
 
 
@@ -71,8 +60,7 @@ if not API_KEYS:
 # ============================================================================
 
 class ProcessLock:
-    """Prevent multiple instances of the script from running simultaneously"""
-    
+    """Prevent multiple instances of the script from running simultaneously"""    
     def __init__(self, lockfile_path="script.lock"):
         self.lockfile_path = lockfile_path
         self.lockfile = None
@@ -267,7 +255,7 @@ class ProgressBar:
         # Use shorter progress format
         progress_part = f'[{bar}] {self.current}/{self.total} ({percent:.1f}%)'
         eta_part = f'ETA: {eta}'
-        workers_part = f'Workers: {workers_display}'
+        workers_part = f'API+DL: {workers_display}'
         
         # Combine the fixed parts
         fixed_parts = f'\r{progress_part} | {eta_part} | {workers_part}'
@@ -315,6 +303,142 @@ class SimpleRateLimiter:
                     time.sleep(wait_time)
             
             self.request_times.append(now)
+
+
+class DownloadJob:
+    """Represents a download job with all necessary information"""
+    
+    def __init__(self, internal_pn, manufacturer_pn, manufacturer_name, datasheet_url, 
+                 found_part, manufacturer_found, digikey_pn):
+        self.internal_pn = internal_pn
+        self.manufacturer_pn = manufacturer_pn
+        self.manufacturer_name = manufacturer_name
+        self.datasheet_url = datasheet_url
+        self.found_part = found_part
+        self.manufacturer_found = manufacturer_found
+        self.digikey_pn = digikey_pn
+        self.filename = f"{internal_pn} {manufacturer_pn}.pdf"
+
+
+class APIWorker:
+    """Dedicated API worker that handles DigiKey API calls and queues download jobs"""
+    
+    def __init__(self, downloader, download_queue, results_queue, progress):
+        self.downloader = downloader
+        self.download_queue = download_queue
+        self.results_queue = results_queue
+        self.progress = progress
+        self.worker_id = "API-Worker"
+        self.is_running = False
+        self.thread = None
+    
+    def start(self):
+        """Start the API worker thread"""
+        if not self.is_running:
+            self.is_running = True
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
+    
+    def stop(self):
+        """Stop the API worker thread"""
+        self.is_running = False
+        if self.thread:
+            self.thread.join(timeout=5)
+    
+    def _run(self):
+        """Main API worker loop"""
+        while self.is_running and not shutdown_flag.is_set():
+            try:
+                # Get next part to process from parts queue (with timeout)
+                try:
+                    part_info = self.parts_queue.get(timeout=1)
+                except queue.Empty:
+                    continue
+                
+                if part_info is None:  # Sentinel value to stop
+                    break
+                
+                internal_pn, manufacturer_pn, manufacturer_name = part_info
+                
+                if self.progress:
+                    self.progress.update_worker_status(self.worker_id, "🔍 API Search", f"{internal_pn}")
+                
+                # Search for the part using API
+                product = self.downloader.search_part(manufacturer_pn, manufacturer_name)
+                
+                if not product:
+                    # Part not found
+                    result = {
+                        'status': 'not_found',
+                        'internal_pn': internal_pn,
+                        'manufacturer_pn': manufacturer_pn
+                    }
+                    self.results_queue.put(result)
+                elif isinstance(product, dict) and product.get('error'):
+                    # API error
+                    result = {
+                        'status': 'error',
+                        'internal_pn': internal_pn,
+                        'manufacturer_pn': manufacturer_pn,
+                        'error': product.get('message', 'Unknown error')
+                    }
+                    self.results_queue.put(result)
+                else:
+                    # Part found - check for datasheet
+                    datasheet_url = product.get('DatasheetUrl')
+                    if not datasheet_url:
+                        # No datasheet available
+                        result = {
+                            'status': 'no_datasheet',
+                            'internal_pn': internal_pn,
+                            'manufacturer_pn': manufacturer_pn,
+                            'found_part': product.get('ManufacturerPartNumber', 'Unknown')
+                        }
+                        self.results_queue.put(result)
+                    else:
+                        # Has datasheet - create download job
+                        manufacturer_info = product.get('Manufacturer', {})
+                        if isinstance(manufacturer_info, dict):
+                            manufacturer_found = manufacturer_info.get('Value', 'Unknown')
+                        else:
+                            manufacturer_found = str(manufacturer_info) if manufacturer_info else 'Unknown'
+                        
+                        download_job = DownloadJob(
+                            internal_pn=internal_pn,
+                            manufacturer_pn=manufacturer_pn,
+                            manufacturer_name=manufacturer_name,
+                            datasheet_url=datasheet_url,
+                            found_part=product.get('ManufacturerPartNumber', manufacturer_pn),
+                            manufacturer_found=manufacturer_found,
+                            digikey_pn=product.get('DigiKeyPartNumber', '')
+                        )
+                        
+                        # Queue for download
+                        self.download_queue.put(download_job)
+                
+                self.parts_queue.task_done()
+                
+            except Exception as e:
+                # Handle unexpected errors
+                if 'part_info' in locals():
+                    result = {
+                        'status': 'error',
+                        'internal_pn': part_info[0] if part_info else 'unknown',
+                        'manufacturer_pn': part_info[1] if part_info else 'unknown',
+                        'error': f'API worker error: {str(e)}'
+                    }
+                    self.results_queue.put(result)
+                    try:
+                        self.parts_queue.task_done()
+                    except:
+                        pass
+        
+        if self.progress:
+            self.progress.update_worker_status(self.worker_id, "⚪ Stopped", "")
+    
+    def set_parts_queue(self, parts_queue):
+        """Set the parts queue for the API worker"""
+        self.parts_queue = parts_queue
 
 # ============================================================================
 # MAIN DOWNLOADER CLASS
@@ -791,8 +915,94 @@ class DigiKeyDownloader:
     # PART PROCESSING METHODS
     # ========================================================================
     
+    def download_worker(self, download_queue, results_queue, progress, worker_id):
+        """Download worker that processes jobs from the download queue"""
+        while not shutdown_flag.is_set():
+            try:
+                # Get next download job from queue (with timeout)
+                try:
+                    job = download_queue.get(timeout=1)
+                except queue.Empty:
+                    continue
+                
+                if job is None:  # Sentinel value to stop
+                    break
+                
+                if progress:
+                    progress.update_worker_status(worker_id, "📥 Downloading", f"{job.internal_pn}")
+                
+                # Check if file already exists and resume is enabled
+                if RESUME_ON_RESTART and os.path.exists(os.path.join("datasheets", job.filename)):
+                    result = {
+                        'status': 'success',
+                        'internal_pn': job.internal_pn,
+                        'manufacturer_pn': job.manufacturer_pn,
+                        'found_part': job.found_part,
+                        'manufacturer': job.manufacturer_found,
+                        'digikey_pn': job.digikey_pn,
+                        'filename': job.filename,
+                        'url': job.datasheet_url,
+                        'skipped': True
+                    }
+                    results_queue.put(result)
+                    download_queue.task_done()
+                    continue
+                
+                # Download the datasheet
+                success = self.download_datasheet(job.datasheet_url, job.filename, "datasheets")
+                
+                if success:
+                    if progress:
+                        progress.update_worker_status(worker_id, "✅ Success", f"{job.internal_pn}")
+                    
+                    result = {
+                        'status': 'success',
+                        'internal_pn': job.internal_pn,
+                        'manufacturer_pn': job.manufacturer_pn,
+                        'found_part': job.found_part,
+                        'manufacturer': job.manufacturer_found,
+                        'digikey_pn': job.digikey_pn,
+                        'filename': job.filename,
+                        'url': job.datasheet_url
+                    }
+                    results_queue.put(result)
+                else:
+                    if progress:
+                        progress.update_worker_status(worker_id, "⚠️ Download failed", f"{job.internal_pn}")
+                    
+                    result = {
+                        'status': 'download_failed',
+                        'internal_pn': job.internal_pn,
+                        'manufacturer_pn': job.manufacturer_pn,
+                        'found_part': job.found_part,
+                        'manufacturer': job.manufacturer_found,
+                        'url': job.datasheet_url,
+                        'message': 'Part found but download blocked (try manual download from URL)'
+                    }
+                    results_queue.put(result)
+                
+                download_queue.task_done()
+                
+            except Exception as e:
+                # Handle unexpected errors
+                if 'job' in locals():
+                    result = {
+                        'status': 'error',
+                        'internal_pn': job.internal_pn,
+                        'manufacturer_pn': job.manufacturer_pn,
+                        'error': f'Download worker error: {str(e)}'
+                    }
+                    results_queue.put(result)
+                    try:
+                        download_queue.task_done()
+                    except:
+                        pass
+        
+        if progress:
+            progress.update_worker_status(worker_id, "⚪ Stopped", "")
+    
     def process_part(self, part_info, progress=None, worker_id=None):
-        """Process a single part with timeout handling"""
+        """Process a single part with timeout handling (LEGACY METHOD - kept for compatibility)"""
         internal_pn, manufacturer_pn, manufacturer_name = part_info
         
         # Check if shutdown requested
@@ -1022,8 +1232,8 @@ class DigiKeyDownloader:
     # ========================================================================
     
     def run(self, input_file="parts_list.txt"):
-        """Main function to download datasheets"""
-        print("🚀 DigiKey Datasheet Downloader")
+        """Main function to download datasheets using queue-based architecture"""
+        print("🚀 DigiKey Datasheet Downloader (Queue-Based)")
         print("=" * 50)
         
         # Load parts list
@@ -1043,54 +1253,69 @@ class DigiKeyDownloader:
                 print(f"📂 Found {existing_count} existing files (will skip)")
         
         print(f"📋 Found {len(parts)} parts to process")
-        print(f"⚙️  Settings: {MAX_WORKERS} workers, {REQUESTS_PER_MINUTE} req/min")
+        print(f"⚙️  Settings: 1 API worker + {MAX_WORKERS} download workers, {REQUESTS_PER_MINUTE} req/min")
         
         # Estimate time
-        estimated_time = (len(parts) * 60) / REQUESTS_PER_MINUTE / MAX_WORKERS
+        estimated_time = (len(parts) * 60) / REQUESTS_PER_MINUTE
         print(f"⏱️  Estimated time: {estimated_time/60:.1f} minutes")
         print("💡 Press Ctrl+C to stop safely at any time")
         print("=" * 50)
         
-        # Initialize progress bar with worker tracking
-        progress = ProgressBar(len(parts), MAX_WORKERS)
+        # Initialize progress bar with API + download workers
+        progress = ProgressBar(len(parts), MAX_WORKERS + 1)  # +1 for API worker
+        
+        # Create queues
+        parts_queue = queue.Queue()
+        download_queue = queue.Queue()
+        results_queue = queue.Queue()
+        
+        # Fill parts queue
+        for part in parts:
+            parts_queue.put(part)
         
         # Track results
         results = {'success': [], 'no_datasheet': [], 'not_found': [], 'download_failed': [], 'errors': []}
         consecutive_errors = 0
+        completed_count = 0
+        
+        # Create and start API worker
+        api_worker = APIWorker(self, download_queue, results_queue, progress)
+        api_worker.set_parts_queue(parts_queue)
+        api_worker.start()
         
         try:
-            # Process parts in parallel with timeout
+            # Start download workers
+            download_workers = []
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                # Submit all tasks - let progress bar assign worker IDs automatically
-                future_to_part = {}
-                for part in parts:
-                    # Check for shutdown before submitting new tasks
-                    if shutdown_flag.is_set():
-                        break
-                    future = executor.submit(self.process_part, part, progress)
-                    future_to_part[future] = part
+                # Submit download worker tasks
+                for i in range(MAX_WORKERS):
+                    worker_id = f"DL-Worker-{i+1}"
+                    future = executor.submit(self.download_worker, download_queue, results_queue, progress, worker_id)
+                    download_workers.append(future)
                 
-                # Use as_completed with timeout to prevent infinite hanging
-                completed_count = 0
-                for future in as_completed(future_to_part, timeout=300):  # 5 minute timeout per batch
-                    # Check for shutdown during processing
-                    if shutdown_flag.is_set():
-                        print("\n⏹️  Cancelling remaining tasks...")
-                        # Cancel all remaining futures
-                        for f in future_to_part.keys():
-                            if not f.done():
-                                f.cancel()
-                        break
-                    
+                # Process results as they come in
+                while completed_count < len(parts) and not shutdown_flag.is_set():
                     try:
-                        result = future.result(timeout=120)  # 2 minute timeout per individual task
+                        # Check for results with timeout
+                        try:
+                            result = results_queue.get(timeout=1)
+                        except queue.Empty:
+                            # Check if API worker is still running and parts queue is empty
+                            if not api_worker.is_running and parts_queue.empty():
+                                # API worker finished, check if download queue is empty
+                                if download_queue.empty():
+                                    # No more work to do
+                                    break
+                            continue
+                        
                         completed_count += 1
                         
                         # Categorize result
                         status = result['status']
                         if status == 'success':
                             results['success'].append(result)
-                            progress.update(f"✅ Downloaded {result['internal_pn']}")
+                            skipped_msg = " (skipped - exists)" if result.get('skipped') else ""
+                            progress.update(f"✅ Downloaded {result['internal_pn']}{skipped_msg}")
                             consecutive_errors = 0  # Reset error counter
                         elif status == 'no_datasheet':
                             results['no_datasheet'].append(result)
@@ -1114,35 +1339,48 @@ class DigiKeyDownloader:
                                 print(f"\n⚠️  Too many consecutive errors ({consecutive_errors}). Pausing for 30 seconds...")
                                 time.sleep(30)
                                 consecutive_errors = 0
-                                
-                    except concurrent.futures.TimeoutError:
-                        print(f"\n⏰ Task timeout - some workers may be hung. Continuing with remaining tasks...")
-                        results['errors'].append({
-                            'status': 'error',
-                            'internal_pn': 'timeout',
-                            'manufacturer_pn': 'timeout',
-                            'error': 'Task timed out'
-                        })
-                        progress.update("⏰ Task timeout")
                         
-                # Check for any remaining uncompleted futures
-                remaining_futures = [f for f in future_to_part.keys() if not f.done()]
-                if remaining_futures:
-                    print(f"\n⚠️  Warning: {len(remaining_futures)} tasks did not complete")
-                    for future in remaining_futures:
-                        future.cancel()  # Try to cancel stuck tasks
+                        results_queue.task_done()
                         
+                    except KeyboardInterrupt:
+                        print("\n⏹️  Shutdown requested...")
+                        shutdown_flag.set()
+                        break
+                    except Exception as e:
+                        print(f"\n❌ Unexpected error in result processing: {e}")
+                        break
+                
+                # Signal workers to stop
+                shutdown_flag.set()
+                
+                # Stop API worker
+                api_worker.stop()
+                
+                # Signal download workers to stop by adding sentinel values
+                for _ in range(MAX_WORKERS):
+                    download_queue.put(None)
+                
+                # Wait for download workers to complete (with timeout)
+                for future in download_workers:
+                    try:
+                        future.result(timeout=10)
+                    except:
+                        pass
+                
                 # Force executor shutdown
-                executor.shutdown(wait=False)  # Don't wait for stuck threads
+                executor.shutdown(wait=False)
         
         except KeyboardInterrupt:
             print("\n⏹️  Download stopped by user")
             shutdown_flag.set()
             print("📊 Partial results:")
-        
         except Exception as e:
             print(f"\n❌ Unexpected error: {e}")
             shutdown_flag.set()
+        finally:
+            # Ensure API worker is stopped
+            if api_worker:
+                api_worker.stop()
         
         # Print summary
         print("\n" + "=" * 50)
