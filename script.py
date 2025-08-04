@@ -9,29 +9,44 @@ import difflib
 import csv
 import concurrent.futures
 import signal
-import atexit
 import socket
-import fcntl
 import re
 import queue
+import logging
 from urllib.parse import quote
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
 
-# Performance Settings
-MAX_WORKERS = 3         # Number of parallel downloads (1-5 recommended)  
-REQUESTS_PER_MINUTE = 15  # Rate limit to avoid being blocked
-TIMEOUT_SECONDS = 30    # Request timeout
+MAX_WORKERS = 5
+MAX_API_WORKERS = 2
+REQUESTS_PER_MINUTE = 120
+TIMEOUT_SECONDS = 30
+RESUME_ON_RESTART = True
 
-# User-Friendly Options
-RESUME_ON_RESTART = True    # Skip files that already exist
-
-# Global shutdown flag for clean exit
 shutdown_flag = threading.Event()
+
+def sanitize_filename(filename):
+    """Sanitize filename by replacing problematic characters for Windows/Unix filesystems"""
+    invalid_chars = ['/', '\\', ':', '*', '?', '"', '<', '>', '|']
+    
+    sanitized = filename
+    for char in invalid_chars:
+        sanitized = sanitized.replace(char, '_')
+    
+    sanitized = sanitized.rstrip('. ')
+    
+    if len(sanitized) > 250:
+        sanitized = sanitized[:250]
+    
+    return sanitized
 
 def load_api_keys():
     """Load API keys from external file"""
@@ -40,106 +55,29 @@ def load_api_keys():
             config = json.load(f)
             return config.get('api_keys', [])
     except FileNotFoundError:
-        print("❌ api_keys.json not found!")
+        logger.error("❌ api_keys.json not found!")
         return []
     except Exception as e:
-        print(f"❌ Error loading API keys: {e}")
+        logger.error(f"❌ Error loading API keys: {e}")
         return []
 
-# Load API keys from file
 API_KEYS = load_api_keys()
 
-# Validate API keys are available
 if not API_KEYS:
-    print("❌ No API keys available")
+    logger.error("❌ No API keys available")
     exit(1)
 
-
-# ============================================================================
-# SIGNAL HANDLING & PROCESS LOCK
-# ============================================================================
-
-class ProcessLock:
-    """Prevent multiple instances of the script from running simultaneously"""    
-    def __init__(self, lockfile_path="script.lock"):
-        self.lockfile_path = lockfile_path
-        self.lockfile = None
-        
-    def acquire(self):
-        """Acquire the process lock"""
-        try:
-            self.lockfile = open(self.lockfile_path, 'w')
-            fcntl.flock(self.lockfile.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            
-            # Write current process info to lock file
-            self.lockfile.write(f"PID: {os.getpid()}\n")
-            self.lockfile.write(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            self.lockfile.flush()
-            
-            return True
-            
-        except (IOError, OSError):
-            if self.lockfile:
-                self.lockfile.close()
-                self.lockfile = None
-            return False
-    
-    def release(self):
-        """Release the process lock"""
-        if self.lockfile:
-            try:
-                fcntl.flock(self.lockfile.fileno(), fcntl.LOCK_UN)
-                self.lockfile.close()
-                os.remove(self.lockfile_path)
-            except (IOError, OSError):
-                pass
-            finally:
-                self.lockfile = None
-    
-    def __enter__(self):
-        if not self.acquire():
-            print("❌ Another instance of the script is already running!")
-            print("💡 If you're sure no other instance is running, delete 'script.lock' file")
-            
-            # Check if lock file exists and show info
-            if os.path.exists(self.lockfile_path):
-                try:
-                    with open(self.lockfile_path, 'r') as f:
-                        content = f.read().strip()
-                        print(f"📄 Lock file contents:\n{content}")
-                except:
-                    pass
-            
-            sys.exit(1)
-        return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.release()
-
-# Global process lock instance
-process_lock = ProcessLock()
 
 def signal_handler(signum, frame):
     """Handle Ctrl+C gracefully"""
     if shutdown_flag.is_set():
-        # Already shutting down, force exit
-        print("\n⚠️  Force terminating...")
-        process_lock.release()  # Ensure lock file is cleaned up
+        logger.warning("\n⚠️  Force terminating...")
         os._exit(1)
     
-    print("\n⏹️  Shutdown requested...")
+    logger.info("\n⏹️  Shutdown requested...")
     shutdown_flag.set()
-    
-    # Clean up lock file
-    process_lock.release()
 
-# Register signal handler and cleanup
 signal.signal(signal.SIGINT, signal_handler)
-atexit.register(lambda: process_lock.release())
-
-# ============================================================================
-# UTILITY CLASSES
-# ============================================================================
 
 class ProgressBar:
     """Simple progress bar with compact worker status"""
@@ -151,8 +89,7 @@ class ProgressBar:
         self.lock = threading.Lock()
         self.max_workers = max_workers
         self.worker_status = {}
-        self.last_display = ""
-        self.last_refresh = 0
+        self.last_line_count = 0  # Track number of lines printed
         self.thread_to_worker = {}  # Map thread IDs to worker numbers
         self.next_worker_id = 1
         self.refresh_interval = 0.5  # Minimum seconds between display updates
@@ -167,17 +104,14 @@ class ProgressBar:
             return self.thread_to_worker[thread_id]
         
     def update_worker_status(self, worker_id, status, part_name=""):
-        """Update worker status without forcing immediate refresh"""
         with self.lock:
             self.worker_status[worker_id] = {
                 'status': status,
                 'part': part_name,
                 'timestamp': time.time()
             }
-            # Don't refresh display automatically - only refresh on progress.update()
     
     def update(self, status="Processing..."):
-        """Update progress counter and force refresh"""
         with self.lock:
             self.current += 1
             self._refresh_display(status)
@@ -188,12 +122,11 @@ class ProgressBar:
                 print(f'\n✅ Completed in {total_time}')
     
     def force_refresh(self):
-        """Force a display refresh (useful for periodic updates)"""
         with self.lock:
             self._refresh_display()
     
     def _refresh_display(self, main_status="Processing..."):
-        """Refresh display as a single line with compact worker info"""
+        """Refresh display with each worker on its own line"""
         # Update last refresh time
         self.last_refresh = time.time()
         
@@ -201,12 +134,10 @@ class ProgressBar:
         percent = (self.current / self.total) * 100 if self.total > 0 else 0
         elapsed = time.time() - self.start_time
         
-        # Progress bar (make it shorter to leave more room for status)
-        bar_length = 20  # Reduced from 30 to 20
+        bar_length = 30
         filled = int(bar_length * self.current / self.total) if self.total > 0 else 0
         bar = '█' * filled + '░' * (bar_length - filled)
         
-        # Calculate ETA
         if self.current > 0:
             rate = self.current / elapsed
             eta_seconds = (self.total - self.current) / rate if rate > 0 else 0
@@ -214,76 +145,67 @@ class ProgressBar:
         else:
             eta = "--:--"
         
-        # Build compact worker status - only show active workers
-        worker_statuses = []
+        if hasattr(self, 'last_line_count'):
+            print(f"\033[{self.last_line_count}A", end='')
+            print("\033[J", end='')
+        
+        progress_line = f"[{bar}] {self.current}/{self.total} ({percent:.1f}%) | ETA: {eta} | {main_status}"
+        print(progress_line)
+        
         current_time = time.time()
+        line_count = 1
         
-        # Sort workers by ID for consistent display
-        active_workers = sorted([wid for wid in self.worker_status.keys() if self.worker_status[wid]])
+        sorted_workers = sorted(self.worker_status.keys())
         
-        for worker_id in active_workers:
-            info = self.worker_status[worker_id]
-            elapsed_worker = current_time - info['timestamp']
-            
-            # Use short status indicators
-            if "Searching" in info['status'] or "🔍" in info['status']:
-                worker_statuses.append("🔍")
-            elif "Downloading" in info['status'] or "📥" in info['status']:
-                worker_statuses.append("📥")
-            elif "Success" in info['status'] or "✅" in info['status']:
-                worker_statuses.append("✅")
-            elif "Not found" in info['status'] or "❌" in info['status']:
-                worker_statuses.append("❌")
-            elif "Error" in info['status'] or "⚠️" in info['status']:
-                worker_statuses.append("⚠️")
-            elif "Idle" in info['status'] or "⚪" in info['status']:
-                worker_statuses.append("⚪")
-            else:
-                worker_statuses.append("🔧")
+        for worker_id in sorted_workers:
+            if worker_id in self.worker_status and self.worker_status[worker_id]:
+                info = self.worker_status[worker_id]
+                elapsed_worker = current_time - info['timestamp']
                 
-            # Add timing warning if slow
-            if elapsed_worker > 30:
-                worker_statuses[-1] += f"({int(elapsed_worker)}s)"
+                # Format worker status with part info
+                status_icon = "🔧"  # Default
+                if "Searching" in info['status'] or "🔍" in info['status']:
+                    status_icon = "🔍"
+                elif "Downloading" in info['status'] or "📥" in info['status']:
+                    status_icon = "📥"
+                elif "Success" in info['status'] or "✅" in info['status']:
+                    status_icon = "✅"
+                elif "Not found" in info['status'] or "❌" in info['status']:
+                    status_icon = "❌"
+                elif "Error" in info['status'] or "⚠️" in info['status']:
+                    status_icon = "⚠️"
+                elif "No datasheet" in info['status']:
+                    status_icon = "📄"
+                elif "Stopped" in info['status'] or "Idle" in info['status'] or "⚪" in info['status']:
+                    status_icon = "⚪"
+                
+                worker_line = f"  {worker_id}: {status_icon} "
+                
+                if info['part']:
+                    part_display = info['part']
+                    if len(part_display) > 20:
+                        part_display = part_display[:17] + "..."
+                    worker_line += f"{part_display}"
+                else:
+                    worker_line += "Idle"
+                
+                if elapsed_worker > 30:
+                    worker_line += f" ({int(elapsed_worker)}s)"
+                
+                print(worker_line)
+                line_count += 1
         
-        # Fill remaining spots with idle indicators if needed
-        while len(worker_statuses) < self.max_workers:
-            worker_statuses.append("⚪")
+        active_worker_count = len([w for w in sorted_workers if w in self.worker_status and self.worker_status[w]])
+        for i in range(active_worker_count, self.max_workers):
+            print(f"  Worker-{i+1}: ⚪ Idle")
+            line_count += 1
         
-        workers_display = " ".join(worker_statuses)
+        self.last_line_count = line_count
         
-        # Build a more compact progress display to leave more room for status
-        # Use shorter progress format
-        progress_part = f'[{bar}] {self.current}/{self.total} ({percent:.1f}%)'
-        eta_part = f'ETA: {eta}'
-        workers_part = f'API+DL: {workers_display}'
-        
-        # Combine the fixed parts
-        fixed_parts = f'\r{progress_part} | {eta_part} | {workers_part}'
-        
-        # Calculate available space for status message (assume 120 char terminal width)
-        terminal_width = 120
-        available_space = terminal_width - len(fixed_parts) - 3  # Leave 3 chars for " | "
-        
-        # Trim main status if needed, but be more generous with space
-        if len(main_status) > available_space and available_space > 10:
-            main_status = main_status[:available_space-3] + "..."
-        elif available_space <= 10:
-            # If very little space, just show first few characters
-            main_status = main_status[:max(available_space, 0)]
-        
-        display_line = f'{fixed_parts} | {main_status}'
-        
-        # Clear any extra characters from previous longer line
-        if len(display_line) < len(self.last_display):
-            display_line += " " * (len(self.last_display) - len(display_line))
-        
-        print(display_line, end='', flush=True)
-        self.last_display = display_line
+        print("", end='', flush=True)
 
 
 class SimpleRateLimiter:
-    """Basic rate limiter to avoid overwhelming servers"""
-    
     def __init__(self, requests_per_minute):
         self.requests_per_minute = requests_per_minute
         self.request_times = []
@@ -292,10 +214,8 @@ class SimpleRateLimiter:
     def wait_if_needed(self):
         with self.lock:
             now = time.time()
-            # Remove old requests (older than 1 minute)
             self.request_times = [t for t in self.request_times if now - t < 60]
             
-            # If we've made too many requests, wait
             if len(self.request_times) >= self.requests_per_minute:
                 oldest = min(self.request_times)
                 wait_time = 60 - (now - oldest) + 1
@@ -304,9 +224,7 @@ class SimpleRateLimiter:
             
             self.request_times.append(now)
 
-
 class DownloadJob:
-    """Represents a download job with all necessary information"""
     
     def __init__(self, internal_pn, manufacturer_pn, manufacturer_name, datasheet_url, 
                  found_part, manufacturer_found, digikey_pn):
@@ -317,54 +235,109 @@ class DownloadJob:
         self.found_part = found_part
         self.manufacturer_found = manufacturer_found
         self.digikey_pn = digikey_pn
-        self.filename = f"{internal_pn} {manufacturer_pn}.pdf"
+        self.filename = sanitize_filename(f"{internal_pn} {manufacturer_pn}") + ".pdf"
 
 
 class APIWorker:
-    """Dedicated API worker that handles DigiKey API calls and queues download jobs"""
-    
-    def __init__(self, downloader, download_queue, results_queue, progress):
+    def __init__(self, downloader, download_queue, results_queue, progress, api_key, worker_id="API-Worker"):
         self.downloader = downloader
         self.download_queue = download_queue
         self.results_queue = results_queue
         self.progress = progress
-        self.worker_id = "API-Worker"
+        self.api_key = api_key
+        self.worker_id = worker_id
         self.is_running = False
         self.thread = None
+        
+        self.rate_limiter = SimpleRateLimiter(REQUESTS_PER_MINUTE)
     
     def start(self):
-        """Start the API worker thread"""
         if not self.is_running:
             self.is_running = True
             self.thread = threading.Thread(target=self._run, daemon=True)
             self.thread.start()
     
     def stop(self):
-        """Stop the API worker thread"""
         self.is_running = False
         if self.thread:
             self.thread.join(timeout=5)
     
     def _run(self):
-        """Main API worker loop"""
         while self.is_running and not shutdown_flag.is_set():
             try:
-                # Get next part to process from parts queue (with timeout)
                 try:
                     part_info = self.parts_queue.get(timeout=1)
                 except queue.Empty:
                     continue
                 
-                if part_info is None:  # Sentinel value to stop
+                if part_info is None:
                     break
                 
                 internal_pn, manufacturer_pn, manufacturer_name = part_info
                 
                 if self.progress:
+                    self.progress.update_worker_status(self.worker_id, "🔍 Checking", f"{internal_pn}")
+                
+                if RESUME_ON_RESTART:
+                    filename = sanitize_filename(f"{internal_pn} {manufacturer_pn}") + ".pdf"
+                    filepath = os.path.join("datasheets", filename)
+                    try:
+                        if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                            # File already exists, skip API call and report success
+                            result = {
+                                'status': 'success',
+                                'internal_pn': internal_pn,
+                                'manufacturer_pn': manufacturer_pn,
+                                'found_part': manufacturer_pn,  # Use manufacturer PN as found part
+                                'manufacturer': 'Unknown',      # We don't know manufacturer without API call
+                                'digikey_pn': '',              # We don't have DigiKey PN without API call
+                                'filename': filename,
+                                'url': '',                     # We don't have URL without API call
+                                'skipped': True
+                            }
+                            self.results_queue.put(result)
+                            self.parts_queue.task_done()
+                            
+                            if self.progress:
+                                self.progress.update_worker_status(self.worker_id, "✅ Exists", f"{internal_pn}")
+                            continue
+                    except (OSError, IOError):
+                        # File system error checking file, proceed with API call
+                        pass
+                
+                if self.progress:
                     self.progress.update_worker_status(self.worker_id, "🔍 API Search", f"{internal_pn}")
                 
-                # Search for the part using API
-                product = self.downloader.search_part(manufacturer_pn, manufacturer_name)
+                # Add timeout protection for the entire part processing
+                part_start_time = time.time()
+                max_part_time = 45  # Maximum 45 seconds per part (including all API calls)
+                
+                try:
+                    # Search for the part using API (with timeout) - use worker's own API key
+                    product = self.search_part_with_key(manufacturer_pn, manufacturer_name)
+                    
+                    # Check if we exceeded time limit
+                    if time.time() - part_start_time > max_part_time:
+                        result = {
+                            'status': 'error',
+                            'internal_pn': internal_pn,
+                            'manufacturer_pn': manufacturer_pn,
+                            'error': 'Processing timeout - try reducing MAX_WORKERS'
+                        }
+                        self.results_queue.put(result)
+                        self.parts_queue.task_done()
+                        continue
+                
+                except Exception as search_error:
+                    result = {
+                        'status': 'error',
+                        'internal_pn': internal_pn,
+                        'manufacturer_pn': manufacturer_pn,
+                        'error': f'Search failed: {str(search_error)}'
+                    }
+                    self.results_queue.put(result)
+                    self.parts_queue.task_done()
+                    continue
                 
                 if not product:
                     # Part not found
@@ -415,6 +388,9 @@ class APIWorker:
                         
                         # Queue for download
                         self.download_queue.put(download_job)
+                        
+                        # Don't put success result here - let download worker handle it
+                        # This avoids duplicate entries in the results
                 
                 self.parts_queue.task_done()
                 
@@ -439,18 +415,66 @@ class APIWorker:
     def set_parts_queue(self, parts_queue):
         """Set the parts queue for the API worker"""
         self.parts_queue = parts_queue
-
-# ============================================================================
-# MAIN DOWNLOADER CLASS
-# ============================================================================
+    
+    def authenticate_worker(self, silent=False):
+        """Authenticate this worker with its own API key"""
+        data = {
+            'client_id': self.api_key['CLIENT_ID'],
+            'client_secret': self.api_key['CLIENT_SECRET'],
+            'grant_type': 'client_credentials'
+        }
+        
+        try:
+            response = requests.post("https://api.digikey.com/v1/oauth2/token", data=data, timeout=30)
+            
+            if response.status_code == 429:
+                if not silent:
+                    logger.warning(f"⚠️  Rate limit hit during worker authentication ({self.worker_id}), waiting 60 seconds...")
+                time.sleep(60)
+                return False
+            elif response.status_code == 200:
+                token_data = response.json()
+                self.access_token = token_data['access_token']
+                expires_in = token_data.get('expires_in', 1800)
+                self.token_expiry = datetime.now() + timedelta(seconds=expires_in - 60)
+                return True
+            else:
+                return False
+                
+        except Exception as e:
+            return False
+    
+    def _ensure_worker_authenticated(self):
+        """Check if worker token is valid, refresh if needed"""
+        if not hasattr(self, 'access_token') or not self.access_token or datetime.now() >= self.token_expiry:
+            # Use silent mode when progress bar is active to avoid logging interference
+            silent = hasattr(self, 'progress') and self.progress is not None
+            return self.authenticate_worker(silent=silent)
+        return True
+    
+    def search_part_with_key(self, part_number, manufacturer_name=None):
+        """Search for a part using this worker's API key"""
+        if not self._ensure_worker_authenticated():
+            return {'error': 'authentication_failed', 'message': 'Failed to authenticate API worker'}
+        
+        headers = {
+            'Authorization': f'Bearer {self.access_token}',
+            'X-DIGIKEY-Client-Id': self.api_key['CLIENT_ID'],
+            'X-DIGIKEY-Locale-Site': 'US',
+        }
+        
+        # Use silent mode when progress bar is active to avoid logging interference
+        silent = hasattr(self, 'progress') and self.progress is not None
+        return self.downloader._search_part_with_headers(part_number, manufacturer_name, headers, self.rate_limiter, silent=silent)
 
 class DigiKeyDownloader:
-    """Simple DigiKey datasheet downloader with bot protection"""
     
     def __init__(self):
         self.access_token = None
         self.token_expiry = None
         self.manufacturers = {}
+        self.acquisition_mappings = {}
+        self.acquisition_history = {}
         self.rate_limiter = SimpleRateLimiter(REQUESTS_PER_MINUTE)
         self.session_lock = threading.Lock()
         
@@ -464,22 +488,33 @@ class DigiKeyDownloader:
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/120.0'
         ]
     
-    # ========================================================================
-    # INITIALIZATION & UTILITY METHODS
-    # ========================================================================
-    
     def _load_manufacturers(self):
         """Load manufacturer database if available"""
         try:
             with open('manufacturers.json', 'r') as f:
                 data = json.load(f)
+                
+                # Load basic manufacturer list
                 for mfr in data.get('Manufacturers', []):
                     name = mfr.get('Name', '').upper()
                     self.manufacturers[name] = mfr.get('Id')
+                
+                # Load acquisition mappings
+                self.acquisition_mappings = data.get('AcquisitionMappings', {})
+                
+                # Load acquisition history for reference
+                self.acquisition_history = data.get('AcquisitionHistory', {})
+                
+                logger.info(f"📋 Loaded {len(self.manufacturers)} manufacturers with {len(self.acquisition_mappings)} acquisition mappings")
+                
         except FileNotFoundError:
-            print("⚠️  manufacturers.json not found - manufacturer filtering disabled")
+            logger.warning("⚠️  manufacturers.json not found - manufacturer filtering disabled")
+            self.acquisition_mappings = {}
+            self.acquisition_history = {}
         except Exception as e:
-            print(f"⚠️  Error loading manufacturers: {e}")
+            logger.warning(f"⚠️  Error loading manufacturers: {e}")
+            self.acquisition_mappings = {}
+            self.acquisition_history = {}
     
     def _make_request(self, url, headers, params=None, stream=False):
         """Make HTTP request with proper error handling and SSL timeout protection"""
@@ -541,15 +576,10 @@ class DigiKeyDownloader:
         
         return headers
     
-    # ========================================================================
-    # AUTHENTICATION METHODS
-    # ========================================================================
-    
-    def authenticate(self):
-        """Get access token from DigiKey"""
-        print("🔐 Authenticating with DigiKey...")
+    def authenticate(self, silent=False):
+        if not silent:
+            logger.info("🔐 Authenticating with DigiKey...")
         
-        # Use the first API key from the loaded configuration
         api_key = API_KEYS[0]
         
         data = {
@@ -561,20 +591,27 @@ class DigiKeyDownloader:
         try:
             response = requests.post("https://api.digikey.com/v1/oauth2/token", data=data, timeout=30)
             
-            if response.status_code == 200:
+            if response.status_code == 429:
+                if not silent:
+                    logger.warning("⚠️  Rate limit hit during authentication, waiting 60 seconds...")
+                time.sleep(60)
+                return False
+            elif response.status_code == 200:
                 token_data = response.json()
                 self.access_token = token_data['access_token']
                 expires_in = token_data.get('expires_in', 1800)
                 self.token_expiry = datetime.now() + timedelta(seconds=expires_in - 60)
                 
-                print("✅ Authentication successful!")
+                if not silent:
+                    logger.info("✅ Authentication successful!")
                 return True
             else:
-                print(f"❌ Authentication failed: {response.status_code}")
+                if not silent:
+                    logger.error(f"❌ Authentication failed: {response.status_code}")
                 return False
                 
         except Exception as e:
-            print(f"❌ Authentication error: {e}")
+            logger.error(f"❌ Authentication error: {e}")
             return False
     
     def _ensure_authenticated(self):
@@ -586,51 +623,18 @@ class DigiKeyDownloader:
     
     # ========================================================================
     # MANUFACTURER MATCHING METHODS
-    # ========================================================================
-    
     def _find_manufacturer_variants(self, manufacturer_name):
-        """Find closest matching manufacturer IDs using fuzzy string matching"""
         if not manufacturer_name or not self.manufacturers:
             return []
         
         name_upper = manufacturer_name.upper().strip()
         matches = []
         
-        # 1. Handle specific common manufacturer mappings FIRST
-        common_mappings = {
-            # Abbreviations to full names and variations
-            'ST': ['STMICROELECTRONICS', 'STM'],
-            'TI': ['TEXAS INSTRUMENTS'],
-            'ADI': ['ANALOG DEVICES'],
-            'ON': ['ONSEMI', 'ON SEMICONDUCTOR'],
-            'NXP': ['NXP SEMICONDUCTORS'],
-            'INFINEON': ['INFINEON TECHNOLOGIES'],
-            'MICROCHIP': ['MICROCHIP TECHNOLOGY'],
-            'MAXIM': ['MAXIM INTEGRATED'],
-            'LINEAR': ['LINEAR TECHNOLOGY'],
-            'FAIRCHILD': ['ONSEMI', 'ON SEMICONDUCTOR', 'FAIRCHILD/ON SEMICONDUCTOR'],
-            'ROHM': ['ROHM SEMICONDUCTOR'],
-            'VISHAY': ['VISHAY INTERTECHNOLOGY'],
-            
-            # Common full name variations that DigiKey uses differently
-            'ON SEMICONDUCTOR': ['ONSEMI', 'ON', 'FAIRCHILD/ON SEMICONDUCTOR'],
-            'ST MICROELECTRONICS': ['STMICROELECTRONICS', 'ST', 'STM'],
-            'TEXAS INSTRUMENTS': ['TI'],
-            'ANALOG DEVICES': ['ADI'],
-            'NXP SEMICONDUCTORS': ['NXP'],
-            'INFINEON TECHNOLOGIES': ['INFINEON'],
-            'MICROCHIP TECHNOLOGY': ['MICROCHIP'],
-            'MAXIM INTEGRATED': ['MAXIM'],
-            'LINEAR TECHNOLOGY': ['LINEAR', 'LTC'],
-            'ROHM SEMICONDUCTOR': ['ROHM'],
-            'VISHAY INTERTECHNOLOGY': ['VISHAY'],
-        }
-        
-        # Apply common mappings first - search both directions
+        # 1. Handle acquisition mappings from JSON file
         search_terms = [name_upper]
         
-        # Add mapped variations for the input name
-        for key, variations in common_mappings.items():
+        # Add mapped variations for the input name from the acquisition mappings
+        for key, variations in self.acquisition_mappings.items():
             if name_upper == key or key in name_upper:
                 search_terms.extend(variations)
             elif any(var in name_upper for var in variations):
@@ -713,13 +717,8 @@ class DigiKeyDownloader:
                 unique_matches.append(match)
         
         return unique_matches[:5]  # Limit to top 5 matches to avoid excessive API calls
-    
-    # ========================================================================
-    # API SEARCH METHODS
-    # ========================================================================
-    
     def search_part(self, part_number, manufacturer_name=None):
-        """Search for a part in DigiKey database with sequential manufacturer ID attempts"""
+        """Search for a part in DigiKey database with sequential manufacturer ID attempts and part number variations"""
         if not self._ensure_authenticated():
             return None
         
@@ -729,75 +728,111 @@ class DigiKeyDownloader:
             'X-DIGIKEY-Locale-Site': 'US',
         }
         
-        url = f"https://api.digikey.com/products/v4/search/{quote(part_number)}/productdetails"
+        return self._search_part_with_headers(part_number, manufacturer_name, headers, self.rate_limiter, silent=False)
+    
+    def _search_part_with_headers(self, part_number, manufacturer_name, headers, rate_limiter, silent=False):
+        """Internal search method that can be used by different workers with their own headers and rate limiters"""
+        search_start_time = time.time()
+        max_search_time = 30
         
-        # First, try without manufacturer filter
-        self.rate_limiter.wait_if_needed()
+        fuzzy_result = self._try_general_search(part_number, manufacturer_name, headers, rate_limiter, silent=silent)
+        if fuzzy_result:
+            return fuzzy_result
+        
+        return None
+    
+    def _try_general_search(self, part_number, manufacturer_name, headers, rate_limiter, silent=False):
+        """Try DigiKey's general search API which has built-in fuzzy matching"""
+        rate_limiter.wait_if_needed()
+        
+        search_data = {
+            "Keywords": part_number,
+            "RecordCount": 10,
+            "RecordStartPosition": 0,
+            "Filters": {}
+        }
+        
+        if manufacturer_name and self.manufacturers:
+            manufacturer_ids = self._find_manufacturer_variants(manufacturer_name)
+            if manufacturer_ids:
+                search_data["Filters"]["ManufacturerIds"] = manufacturer_ids[:3]
+        
         try:
-            response = self._make_request(url, headers)
+            response = requests.post(
+                "https://api.digikey.com/products/v4/search/keyword", 
+                json=search_data,
+                headers=headers,
+                timeout=(10, 30)
+            )
+            
+            # Check for rate limit error before processing
+            if response.status_code == 429:
+                if not silent:
+                    logger.warning(f"⚠️  Rate limit hit for {part_number}, waiting 60 seconds...")
+                time.sleep(60)
+                return None
+            
+            response.raise_for_status()
             
             if response.status_code == 200:
                 result = response.json()
-                if 'Product' in result:
-                    product = result['Product']
-                    # Normalize field names
-                    if 'ManufacturerProductNumber' in product and 'ManufacturerPartNumber' not in product:
-                        product['ManufacturerPartNumber'] = product['ManufacturerProductNumber']
-                    return product
-                    
-            elif response.status_code == 404:
-                # Check if it's a "duplicate products" error
-                try:
-                    error_data = response.json()
-                    if "Duplicate Products found" not in error_data.get('detail', ''):
-                        # Regular 404 - part not found
-                        return None
-                except:
-                    # Regular 404 - part not found
-                    return None
-                    
-                # Multiple products found - try with manufacturer filters
-                if manufacturer_name:
-                    manufacturer_ids = self._find_manufacturer_variants(manufacturer_name)
-                    
-                    for i, mfr_id in enumerate(manufacturer_ids):
-                        # Rate limit each attempt
-                        self.rate_limiter.wait_if_needed()
-                        
-                        try:
-                            response = self._make_request(url, headers, params={'manufacturerId': mfr_id})
-                            
-                            if response.status_code == 200:
-                                result = response.json()
-                                if 'Product' in result:
-                                    product = result['Product']
-                                    # Normalize field names
-                                    if 'ManufacturerProductNumber' in product and 'ManufacturerPartNumber' not in product:
-                                        product['ManufacturerPartNumber'] = product['ManufacturerProductNumber']
-                                    return product
-                            # If 404 or other error, continue to next manufacturer ID
-                            
-                        except Exception:
-                            # Error with this manufacturer ID, try next one
-                            continue
-                    
-                    # If we get here, none of the manufacturer IDs worked
-                    return {'error': 'multiple_products', 'message': f'Multiple products found for "{manufacturer_name}" - tried {len(manufacturer_ids)} manufacturer variants'}
-                else:
-                    return {'error': 'multiple_products', 'message': 'Multiple products found - manufacturer name needed to filter results'}
+                products = result.get('Products', [])
+                
+                if products:
+                    # Look for exact or close matches in the results
+                    best_match = self._find_best_match(part_number, products)
+                    if best_match:
+                        # Normalize field names
+                        if 'ManufacturerProductNumber' in best_match and 'ManufacturerPartNumber' not in best_match:
+                            best_match['ManufacturerPartNumber'] = best_match['ManufacturerProductNumber']
+                        return best_match
             
-            # Other HTTP errors
-            return None
-            
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429:
+                if not silent:
+                    logger.warning(f"⚠️  Rate limit hit for {part_number}, waiting 60 seconds...")
+                time.sleep(60)
+                return None
+            else:
+                pass
         except Exception as e:
-            return None
+            pass
+        
+        return None
     
-    # ========================================================================
-    # DOWNLOAD METHODS
-    # ========================================================================
+    def _find_best_match(self, original_part, products):
+        """Find the best matching product from search results"""
+        
+        # First priority: exact match (case-insensitive)
+        for product in products:
+            mfr_pn = product.get('ManufacturerPartNumber', '') or product.get('ManufacturerProductNumber', '')
+            if mfr_pn and mfr_pn.upper() == original_part.upper():
+                return product
+        
+        # Second priority: starts with the original part number
+        for product in products:
+            mfr_pn = product.get('ManufacturerPartNumber', '') or product.get('ManufacturerProductNumber', '')
+            if mfr_pn:
+                if (mfr_pn.upper().startswith(original_part.upper()) or 
+                    original_part.upper().startswith(mfr_pn.upper())):
+                    return product
+        
+        # Third priority: return first result if it's active and has a datasheet
+        for product in products:
+            if product.get('ProductStatus') == 'Active' and product.get('DatasheetUrl'):
+                return product
+        
+        # Last resort: return first result
+        if products:
+            return products[0]
+        
+        return None
     
+    def _generate_part_variations(self, part_number):
+        """Return the original part number as-is without variations"""
+        return [part_number]
     def download_datasheet(self, url, filename, output_dir):
-        """Download a datasheet PDF with enhanced timeout handling"""
+        """Download a datasheet PDF with enhanced timeout handling and minimal headers strategy"""
         if not url:
             return False
         
@@ -809,7 +844,6 @@ class DigiKeyDownloader:
             return True
         
         domain = url.split('/')[2] if '://' in url else ''
-        headers = self._get_headers(domain)
         
         # Special handling for known problematic domains
         problematic_domains = ['st.com', 'stmicroelectronics.com']
@@ -826,6 +860,19 @@ class DigiKeyDownloader:
             try:
                 # Add small random delay
                 time.sleep(random.uniform(0.5, 2.0))
+                
+                # Strategy: Try without headers first, then with headers if we get 403
+                use_headers = False
+                
+                # On first attempt, try without headers (many servers are more lenient)
+                # On subsequent attempts after 403, try with headers
+                if attempt == 0:
+                    # First attempt: minimal headers to avoid detection
+                    headers = {'Accept': '*/*'}
+                else:
+                    # Subsequent attempts: use full browser headers
+                    use_headers = True
+                    headers = self._get_headers(domain)
                 
                 # Override timeout for this specific request if problematic
                 if is_problematic:
@@ -850,7 +897,12 @@ class DigiKeyDownloader:
                 
                 # Handle common errors
                 if response.status_code == 403:
-                    if attempt < max_attempts - 1:
+                    if not use_headers and attempt < max_attempts - 1:
+                        # If we got 403 without headers, try again with headers
+                        time.sleep(2 ** attempt)  # Exponential backoff
+                        continue
+                    elif attempt < max_attempts - 1:
+                        # If we got 403 with headers, wait longer and try again
                         time.sleep(2 ** attempt)  # Exponential backoff
                         continue
                     return False
@@ -911,10 +963,6 @@ class DigiKeyDownloader:
         
         return False
     
-    # ========================================================================
-    # PART PROCESSING METHODS
-    # ========================================================================
-    
     def download_worker(self, download_queue, results_queue, progress, worker_id):
         """Download worker that processes jobs from the download queue"""
         while not shutdown_flag.is_set():
@@ -932,21 +980,27 @@ class DigiKeyDownloader:
                     progress.update_worker_status(worker_id, "📥 Downloading", f"{job.internal_pn}")
                 
                 # Check if file already exists and resume is enabled
-                if RESUME_ON_RESTART and os.path.exists(os.path.join("datasheets", job.filename)):
-                    result = {
-                        'status': 'success',
-                        'internal_pn': job.internal_pn,
-                        'manufacturer_pn': job.manufacturer_pn,
-                        'found_part': job.found_part,
-                        'manufacturer': job.manufacturer_found,
-                        'digikey_pn': job.digikey_pn,
-                        'filename': job.filename,
-                        'url': job.datasheet_url,
-                        'skipped': True
-                    }
-                    results_queue.put(result)
-                    download_queue.task_done()
-                    continue
+                if RESUME_ON_RESTART:
+                    filepath = os.path.join("datasheets", job.filename)
+                    try:
+                        if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                            result = {
+                                'status': 'success',
+                                'internal_pn': job.internal_pn,
+                                'manufacturer_pn': job.manufacturer_pn,
+                                'found_part': job.found_part,
+                                'manufacturer': job.manufacturer_found,
+                                'digikey_pn': job.digikey_pn,
+                                'filename': job.filename,
+                                'url': job.datasheet_url,
+                                'skipped': True
+                            }
+                            results_queue.put(result)
+                            download_queue.task_done()
+                            continue
+                    except (OSError, IOError):
+                        # File system error checking file, proceed with download
+                        pass
                 
                 # Download the datasheet
                 success = self.download_datasheet(job.datasheet_url, job.filename, "datasheets")
@@ -1062,7 +1116,7 @@ class DigiKeyDownloader:
                 progress.update_worker_status(worker_id, "📥 Downloading", f"{internal_pn}")
             
             # Download datasheet
-            filename = f"{internal_pn} {manufacturer_pn}.pdf"
+            filename = sanitize_filename(f"{internal_pn} {manufacturer_pn}") + ".pdf"
             success = self.download_datasheet(datasheet_url, filename, "datasheets")
             
             if success:
@@ -1120,10 +1174,6 @@ class DigiKeyDownloader:
             if progress:
                 progress.update_worker_status(worker_id, "⚪ Idle", "")
     
-    # ========================================================================
-    # FILE HANDLING METHODS
-    # ========================================================================
-    
     def load_parts_list(self, filename="parts_list.txt"):
         """Load parts list from file (supports both CSV and text formats)"""
         parts = []
@@ -1166,7 +1216,7 @@ class DigiKeyDownloader:
                             break
                     
                     if not internal_col or not mfr_pn_col:
-                        print(f"❌ CSV missing required columns. Found: {valid_columns}")
+                        logger.error(f"❌ CSV missing required columns. Found: {valid_columns}")
                         return []
                     
                     for row in reader:
@@ -1194,10 +1244,10 @@ class DigiKeyDownloader:
             return parts
             
         except FileNotFoundError:
-            print(f"❌ File '{filename}' not found")
+            logger.error(f"❌ File '{filename}' not found")
             return []
         except Exception as e:
-            print(f"❌ Error loading parts list: {e}")
+            logger.error(f"❌ Error loading parts list: {e}")
             return []
     
     def _save_report(self, results):
@@ -1208,33 +1258,30 @@ class DigiKeyDownloader:
             f.write("Status,Internal P/N,Manufacturer P/N,Found Part,Manufacturer,Filename/URL,Notes\n")
             
             for item in results['success']:
-                f.write(f"Success,{item['internal_pn']},{item['manufacturer_pn']},{item['found_part']},{item['manufacturer']},{item['filename']},Downloaded\n")
+                filename = item.get('filename', 'Downloaded')
+                f.write(f"Success,{item['internal_pn']},\"{item['manufacturer_pn']}\",\"{item['found_part']}\",{item['manufacturer']},\"{filename}\",Downloaded\n")
             
             for item in results['no_datasheet']:
-                f.write(f"No Datasheet,{item['internal_pn']},{item['manufacturer_pn']},{item.get('found_part', '')},,,No datasheet available\n")
+                f.write(f"No Datasheet,{item['internal_pn']},\"{item['manufacturer_pn']}\",\"{item.get('found_part', '')}\",,,No datasheet available\n")
             
             for item in results['not_found']:
-                f.write(f"Not Found,{item['internal_pn']},{item['manufacturer_pn']},,,,Part not found in DigiKey\n")
+                f.write(f"Not Found,{item['internal_pn']},\"{item['manufacturer_pn']}\",,,,Part not found in DigiKey\n")
             
             for item in results['download_failed']:
                 # Use the datasheet URL instead of filename for failed downloads
                 url = item.get('url', '')
-                f.write(f"Download Failed,{item['internal_pn']},{item['manufacturer_pn']},{item.get('found_part', '')},{item.get('manufacturer', '')},{url},Manual download required\n")
+                f.write(f"Download Failed,{item['internal_pn']},\"{item['manufacturer_pn']}\",\"{item.get('found_part', '')}\",{item.get('manufacturer', '')},\"{url}\",Manual download required\n")
             
             for item in results['errors']:
                 error_msg = item.get('error', 'Unknown error')
-                f.write(f"Error,{item['internal_pn']},{item['manufacturer_pn']},,,,{error_msg}\n")
+                f.write(f"Error,{item['internal_pn']},\"{item['manufacturer_pn']}\",,,,{error_msg}\n")
         
-        print(f"📄 Report saved: datasheets/report.csv")
-    
-    # ========================================================================
-    # MAIN EXECUTION METHOD
-    # ========================================================================
+        logger.info(f"📄 Report saved: datasheets/report.csv")
     
     def run(self, input_file="parts_list.txt"):
-        """Main function to download datasheets using queue-based architecture"""
-        print("🚀 DigiKey Datasheet Downloader (Queue-Based)")
-        print("=" * 50)
+        """Main function to download datasheetse"""
+        logger.info("🚀 DigiKey Datasheet Downloader)")
+        logger.info("=" * 50)
         
         # Load parts list
         parts = self.load_parts_list(input_file)
@@ -1245,24 +1292,31 @@ class DigiKeyDownloader:
         existing_count = 0
         if RESUME_ON_RESTART:
             for internal_pn, manufacturer_pn, _ in parts:
-                filename = f"{internal_pn} {manufacturer_pn}.pdf"
+                filename = sanitize_filename(f"{internal_pn} {manufacturer_pn}") + ".pdf"
                 if os.path.exists(os.path.join("datasheets", filename)):
                     existing_count += 1
             
             if existing_count > 0:
-                print(f"📂 Found {existing_count} existing files (will skip)")
+                logger.info(f"📂 Found {existing_count} existing files (will skip)")
         
-        print(f"📋 Found {len(parts)} parts to process")
-        print(f"⚙️  Settings: 1 API worker + {MAX_WORKERS} download workers, {REQUESTS_PER_MINUTE} req/min")
+        # Validate we have enough API keys for the desired number of workers
+        available_api_keys = len(API_KEYS)
+        actual_api_workers = min(MAX_API_WORKERS, available_api_keys)
         
-        # Estimate time
-        estimated_time = (len(parts) * 60) / REQUESTS_PER_MINUTE
-        print(f"⏱️  Estimated time: {estimated_time/60:.1f} minutes")
-        print("💡 Press Ctrl+C to stop safely at any time")
-        print("=" * 50)
+        if actual_api_workers < MAX_API_WORKERS:
+            logger.warning(f"⚠️  Only {available_api_keys} API keys available, using {actual_api_workers} API workers instead of {MAX_API_WORKERS}")
+        
+        logger.info(f"📋 Found {len(parts)} parts to process")
+        logger.info(f"⚙️  Settings: {actual_api_workers} API workers + {MAX_WORKERS} download workers, {REQUESTS_PER_MINUTE} req/min per API worker")
+        
+        # Estimate time (with multiple API workers, search should be faster)
+        estimated_time = (len(parts) * 60) / (REQUESTS_PER_MINUTE * actual_api_workers)
+        logger.info(f"⏱️  Estimated time: {estimated_time/60:.1f} minutes")
+        logger.info("💡 Press Ctrl+C to stop safely at any time")
+        logger.info("=" * 50)
         
         # Initialize progress bar with API + download workers
-        progress = ProgressBar(len(parts), MAX_WORKERS + 1)  # +1 for API worker
+        progress = ProgressBar(len(parts), MAX_WORKERS + actual_api_workers)
         
         # Create queues
         parts_queue = queue.Queue()
@@ -1278,10 +1332,14 @@ class DigiKeyDownloader:
         consecutive_errors = 0
         completed_count = 0
         
-        # Create and start API worker
-        api_worker = APIWorker(self, download_queue, results_queue, progress)
-        api_worker.set_parts_queue(parts_queue)
-        api_worker.start()
+        # Create and start API workers (multiple workers with different API keys)
+        api_workers = []
+        for i in range(actual_api_workers):
+            worker_id = f"API-Worker-{i+1}" if actual_api_workers > 1 else "API-Worker"
+            api_worker = APIWorker(self, download_queue, results_queue, progress, API_KEYS[i], worker_id)
+            api_worker.set_parts_queue(parts_queue)
+            api_worker.start()
+            api_workers.append(api_worker)
         
         try:
             # Start download workers
@@ -1336,25 +1394,26 @@ class DigiKeyDownloader:
                             
                             # Auto-pause on too many consecutive errors (5 errors)
                             if consecutive_errors >= 5:
-                                print(f"\n⚠️  Too many consecutive errors ({consecutive_errors}). Pausing for 30 seconds...")
+                                logger.warning(f"\n⚠️  Too many consecutive errors ({consecutive_errors}). Pausing for 30 seconds...")
                                 time.sleep(30)
                                 consecutive_errors = 0
                         
                         results_queue.task_done()
                         
                     except KeyboardInterrupt:
-                        print("\n⏹️  Shutdown requested...")
+                        logger.info("\n⏹️  Shutdown requested...")
                         shutdown_flag.set()
                         break
                     except Exception as e:
-                        print(f"\n❌ Unexpected error in result processing: {e}")
+                        logger.error(f"\n❌ Unexpected error in result processing: {e}")
                         break
                 
                 # Signal workers to stop
                 shutdown_flag.set()
                 
-                # Stop API worker
-                api_worker.stop()
+                # Stop all API workers
+                for api_worker in api_workers:
+                    api_worker.stop()
                 
                 # Signal download workers to stop by adding sentinel values
                 for _ in range(MAX_WORKERS):
@@ -1371,55 +1430,50 @@ class DigiKeyDownloader:
                 executor.shutdown(wait=False)
         
         except KeyboardInterrupt:
-            print("\n⏹️  Download stopped by user")
+            logger.info("\n⏹️  Download stopped by user")
             shutdown_flag.set()
-            print("📊 Partial results:")
+            logger.info("📊 Partial results:")
         except Exception as e:
-            print(f"\n❌ Unexpected error: {e}")
+            logger.error(f"\n❌ Unexpected error: {e}")
             shutdown_flag.set()
         finally:
-            # Ensure API worker is stopped
-            if api_worker:
-                api_worker.stop()
+            # Ensure all API workers are stopped
+            if 'api_workers' in locals():
+                for api_worker in api_workers:
+                    api_worker.stop()
         
         # Print summary
-        print("\n" + "=" * 50)
-        print("📊 SUMMARY")
-        print("=" * 50)
-        print(f"✅ Downloaded: {len(results['success'])}")
-        print(f"⚠️  No datasheet: {len(results['no_datasheet'])}")
-        print(f"❌ Not found: {len(results['not_found'])}")
-        print(f"⚠️  Download failed: {len(results['download_failed'])}")
-        print(f"❌ Errors: {len(results['errors'])}")
+        logger.info("\n" + "=" * 50)
+        logger.info("📊 SUMMARY")
+        logger.info("=" * 50)
+        logger.info(f"✅ Downloaded: {len(results['success'])}")
+        logger.info(f"⚠️  No datasheet: {len(results['no_datasheet'])}")
+        logger.info(f"❌ Not found: {len(results['not_found'])}")
+        logger.info(f"⚠️  Download failed: {len(results['download_failed'])}")
+        logger.info(f"❌ Errors: {len(results['errors'])}")
         
         # Save simple report
         self._save_report(results)
         
         return results
 
-# ============================================================================
-# MAIN EXECUTION
-# ============================================================================
-
 def main():
     """Main function"""
-    # Use process lock to prevent multiple instances
-    with process_lock:
-        # Check for existing files and run accordingly
-        if os.path.exists("parts_list.csv"):
-            print("📋 Found parts_list.csv")
-            downloader = DigiKeyDownloader()
-            downloader.run("parts_list.csv")
-        elif os.path.exists("parts_list.txt"):
-            print("📋 Found parts_list.txt")
-            downloader = DigiKeyDownloader()
-            downloader.run("parts_list.txt")
-        else:
-            print("❌ No parts list found!")
-            print("📝 Please create either:")
-            print("   • parts_list.csv (recommended)")
-            print("   • parts_list.txt")
-            print("\n💡 See README.md for format details")
+    # Check for existing files and run accordingly
+    if os.path.exists("parts.csv"):
+        logger.info("📋 Found parts.csv")
+        downloader = DigiKeyDownloader()
+        downloader.run("parts.csv")
+    elif os.path.exists("parts.txt"):
+        logger.info("📋 Found parts.txt")
+        downloader = DigiKeyDownloader()
+        downloader.run("parts.txt")
+    else:
+        logger.error("❌ No parts list found!")
+        logger.info("📝 Please create either:")
+        logger.info("   • parts.csv (recommended)")
+        logger.info("   • parts.txt")
+        logger.info("\n💡 See README.md for format details")
 
 
 if __name__ == "__main__":

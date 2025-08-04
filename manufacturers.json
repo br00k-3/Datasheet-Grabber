@@ -1,5 +1,5 @@
 {
-  "Manufacturers": [
+ "Manufacturers": [
     {
       "Id": 2322,
       "Name": "1GLOBAL"
@@ -23832,5 +23832,347 @@
       "Id": 601650,
       "Name": "Zurn"
     }
-  ]
+  ],
+  "AcquisitionMappings": {
+    "ST": [
+      "STMICROELECTRONICS",
+      "STM"
+    ],
+    "TI": [
+      "TEXAS INSTRUMENTS"
+    ],
+    "ADI": [
+      "ANALOG DEVICES"
+    ],
+    "ON": [
+      "ONSEMI",
+      "ON SEMICONDUCTOR"
+    ],
+    "NXP": [
+      "NXP SEMICONDUCTORS"
+    ],
+    "INFINEON": [
+      "INFINEON TECHNOLOGIES"
+    ],
+    "MICROCHIP": [
+      "MICROCHIP TECHNOLOGY"
+    ],
+    "MAXIM": [
+      "MAXIM INTEGRATED",
+      "ANALOG DEVICES"
+    ],
+    "LINEAR": [
+      "LINEAR TECHNOLOGY",
+      "ANALOG DEVICES"
+    ],
+    "ROHM": [
+      "ROHM SEMICONDUCTOR"
+    ],
+    "VISHAY": [
+      "VISHAY INTERTECHNOLOGY"
+    ],
+    "FAIRCHILD": [
+      "ONSEMI",
+      "ON SEMICONDUCTOR",
+      "FAIRCHILD/ON SEMICONDUCTOR"
+    ],
+    "CYPRESS": [
+      "INFINEON TECHNOLOGIES",
+      "CYPRESS SEMICONDUCTOR"
+    ],
+    "INTERNATIONAL RECTIFIER": [
+      "INFINEON TECHNOLOGIES",
+      "IR"
+    ],
+    "IR": [
+      "INFINEON TECHNOLOGIES",
+      "INTERNATIONAL RECTIFIER"
+    ],
+    "ATMEL": [
+      "MICROCHIP TECHNOLOGY",
+      "ATMEL CORPORATION"
+    ],
+    "MICROSEMI": [
+      "MICROCHIP TECHNOLOGY"
+    ],
+    "PMC-SIERRA": [
+      "MICROSEMI",
+      "MICROCHIP TECHNOLOGY"
+    ],
+    "LATTICE": [
+      "LATTICE SEMICONDUCTOR"
+    ],
+    "XILINX": [
+      "AMD",
+      "XILINX INC"
+    ],
+    "ALTERA": [
+      "INTEL",
+      "INTEL CORPORATION"
+    ],
+    "BROADCOM": [
+      "BROADCOM INC",
+      "AVAGO TECHNOLOGIES"
+    ],
+    "AVAGO": [
+      "BROADCOM INC",
+      "BROADCOM"
+    ],
+    "LSI": [
+      "BROADCOM INC",
+      "AVAGO TECHNOLOGIES"
+    ],
+    "FREESCALE": [
+      "NXP SEMICONDUCTORS",
+      "NXP"
+    ],
+    "MOTOROLA": [
+      "NXP SEMICONDUCTORS",
+      "FREESCALE"
+    ],
+    "SPANSION": [
+      "CYPRESS SEMICONDUCTOR",
+      "INFINEON TECHNOLOGIES"
+    ],
+    "ZARLINK": [
+      "MICROSEMI",
+      "MICROCHIP TECHNOLOGY"
+    ],
+    "ACTEL": [
+      "MICROSEMI",
+      "MICROCHIP TECHNOLOGY"
+    ],
+    "VITESSE": [
+      "MICROSEMI",
+      "MICROCHIP TECHNOLOGY"
+    ],
+    "ELAN": [
+      "MICROCHIP TECHNOLOGY"
+    ],
+    "SST": [
+      "MICROCHIP TECHNOLOGY"
+    ],
+    "SILICON STORAGE TECHNOLOGY": [
+      "MICROCHIP TECHNOLOGY",
+      "SST"
+    ],
+    "SUPERTEX": [
+      "MICROCHIP TECHNOLOGY"
+    ],
+    "CLARE": [
+      "IXYS",
+      "LITTELFUSE"
+    ],
+    "IXYS": [
+      "LITTELFUSE"
+    ],
+    "PEREGRINE": [
+      "MURATA",
+      "MURATA ELECTRONICS"
+    ],
+    "SEMTECH": [
+      "SEMTECH CORPORATION"
+    ],
+    "SILICON LABS": [
+      "SILICON LABORATORIES"
+    ],
+    "SILABS": [
+      "SILICON LABORATORIES",
+      "SILICON LABS"
+    ],
+    "RENESAS": [
+      "RENESAS ELECTRONICS"
+    ],
+    "IDT": [
+      "RENESAS ELECTRONICS"
+    ],
+    "INTEGRATED DEVICE TECHNOLOGY": [
+      "RENESAS ELECTRONICS",
+      "IDT"
+    ],
+    "INTERSIL": [
+      "RENESAS ELECTRONICS"
+    ],
+    "MARVEL": [
+      "MARVELL TECHNOLOGY"
+    ],
+    "MARVELL": [
+      "MARVELL TECHNOLOGY"
+    ],
+    "CAVIUM": [
+      "MARVELL TECHNOLOGY"
+    ],
+    "PMC": [
+      "MICROSEMI",
+      "MICROCHIP TECHNOLOGY"
+    ],
+    "ON SEMICONDUCTOR": [
+      "ONSEMI",
+      "ON",
+      "FAIRCHILD/ON SEMICONDUCTOR"
+    ],
+    "ST MICROELECTRONICS": [
+      "STMICROELECTRONICS",
+      "ST",
+      "STM"
+    ],
+    "TEXAS INSTRUMENTS": [
+      "TI"
+    ],
+    "ANALOG DEVICES": [
+      "ADI",
+      "MAXIM INTEGRATED",
+      "LINEAR TECHNOLOGY"
+    ],
+    "NXP SEMICONDUCTORS": [
+      "NXP",
+      "FREESCALE"
+    ],
+    "INFINEON TECHNOLOGIES": [
+      "INFINEON",
+      "INTERNATIONAL RECTIFIER",
+      "IR",
+      "CYPRESS SEMICONDUCTOR"
+    ],
+    "MICROCHIP TECHNOLOGY": [
+      "MICROCHIP",
+      "ATMEL",
+      "MICROSEMI",
+      "SUPERTEX",
+      "SST"
+    ],
+    "MAXIM INTEGRATED": [
+      "MAXIM",
+      "ANALOG DEVICES"
+    ],
+    "LINEAR TECHNOLOGY": [
+      "LINEAR",
+      "LTC",
+      "ANALOG DEVICES"
+    ],
+    "ROHM SEMICONDUCTOR": [
+      "ROHM"
+    ],
+    "VISHAY INTERTECHNOLOGY": [
+      "VISHAY"
+    ],
+    "CYPRESS SEMICONDUCTOR": [
+      "CYPRESS",
+      "INFINEON TECHNOLOGIES",
+      "SPANSION"
+    ],
+    "LATTICE SEMICONDUCTOR": [
+      "LATTICE"
+    ],
+    "SILICON LABORATORIES": [
+      "SILICON LABS",
+      "SILABS"
+    ],
+    "LITTELFUSE": [
+      "IXYS",
+      "CLARE"
+    ],
+    "BROADCOM INC": [
+      "BROADCOM",
+      "AVAGO TECHNOLOGIES",
+      "LSI"
+    ],
+    "RENESAS ELECTRONICS": [
+      "RENESAS",
+      "IDT",
+      "INTEGRATED DEVICE TECHNOLOGY",
+      "INTERSIL"
+    ],
+    "MARVELL TECHNOLOGY": [
+      "MARVELL",
+      "MARVEL",
+      "CAVIUM"
+    ]
+  },
+  "AcquisitionHistory": {
+    "FAIRCHILD_TO_ONSEMI": {
+      "description": "Fairchild Semiconductor acquired by ON Semiconductor in 2016",
+      "year": 2016,
+      "old_name": "FAIRCHILD",
+      "new_name": "ONSEMI"
+    },
+    "ATMEL_TO_MICROCHIP": {
+      "description": "Atmel Corporation acquired by Microchip Technology in 2016",
+      "year": 2016,
+      "old_name": "ATMEL",
+      "new_name": "MICROCHIP TECHNOLOGY"
+    },
+    "LINEAR_TO_ADI": {
+      "description": "Linear Technology acquired by Analog Devices in 2017",
+      "year": 2017,
+      "old_name": "LINEAR TECHNOLOGY",
+      "new_name": "ANALOG DEVICES"
+    },
+    "IR_TO_INFINEON": {
+      "description": "International Rectifier acquired by Infineon Technologies in 2015",
+      "year": 2015,
+      "old_name": "INTERNATIONAL RECTIFIER",
+      "new_name": "INFINEON TECHNOLOGIES"
+    },
+    "CYPRESS_TO_INFINEON": {
+      "description": "Cypress Semiconductor acquired by Infineon Technologies in 2020",
+      "year": 2020,
+      "old_name": "CYPRESS SEMICONDUCTOR",
+      "new_name": "INFINEON TECHNOLOGIES"
+    },
+    "MAXIM_TO_ADI": {
+      "description": "Maxim Integrated acquired by Analog Devices in 2021",
+      "year": 2021,
+      "old_name": "MAXIM INTEGRATED",
+      "new_name": "ANALOG DEVICES"
+    },
+    "XILINX_TO_AMD": {
+      "description": "Xilinx acquired by AMD in 2022",
+      "year": 2022,
+      "old_name": "XILINX",
+      "new_name": "AMD"
+    },
+    "ALTERA_TO_INTEL": {
+      "description": "Altera acquired by Intel in 2015",
+      "year": 2015,
+      "old_name": "ALTERA",
+      "new_name": "INTEL"
+    },
+    "MICROSEMI_TO_MICROCHIP": {
+      "description": "Microsemi acquired by Microchip Technology in 2018",
+      "year": 2018,
+      "old_name": "MICROSEMI",
+      "new_name": "MICROCHIP TECHNOLOGY"
+    },
+    "FREESCALE_TO_NXP": {
+      "description": "Freescale Semiconductor acquired by NXP Semiconductors in 2015",
+      "year": 2015,
+      "old_name": "FREESCALE",
+      "new_name": "NXP SEMICONDUCTORS"
+    },
+    "IDT_TO_RENESAS": {
+      "description": "Integrated Device Technology (IDT) acquired by Renesas Electronics in 2019",
+      "year": 2019,
+      "old_name": "IDT",
+      "new_name": "RENESAS ELECTRONICS"
+    },
+    "INTERSIL_TO_RENESAS": {
+      "description": "Intersil acquired by Renesas Electronics in 2017",
+      "year": 2017,
+      "old_name": "INTERSIL",
+      "new_name": "RENESAS ELECTRONICS"
+    },
+    "CAVIUM_TO_MARVELL": {
+      "description": "Cavium acquired by Marvell Technology in 2018",
+      "year": 2018,
+      "old_name": "CAVIUM",
+      "new_name": "MARVELL TECHNOLOGY"
+    },
+    "IXYS_TO_LITTELFUSE": {
+      "description": "IXYS Corporation acquired by Littelfuse in 2018",
+      "year": 2018,
+      "old_name": "IXYS",
+      "new_name": "LITTELFUSE"
+    }
+  }
 }
