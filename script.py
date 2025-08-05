@@ -1,14 +1,23 @@
-
 import requests, os, json, time, random, threading, sys, csv, queue, logging
+from rich.console import Console, Group
+from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn, SpinnerColumn
+from rich.table import Table
+from rich.live import Live
 from datetime import datetime, timedelta
 
+
+
 # CONFIGURATION
-MAX_WORKERS = 3
+MAX_WORKERS = 5
 MAX_API_WORKERS = 1
 REQUESTS_PER_MINUTE = 120
-TIMEOUT_SECONDS = 30
-RESUME_ON_RESTART = True
+MAX_ATTEMPTS = 3
 LOGGING = True  # Enable logging to file
+CRAWL_DELAY_DEFAULT = 0
+
+ 
+class RateLimitExceeded(Exception):
+    pass
 
 class MaxLevelFilter(logging.Filter):
     def __init__(self, level):
@@ -51,90 +60,79 @@ def load_api_keys():
 
 API_KEYS = load_api_keys()
 
-def download_pdf_with_requests(url, filepath):
+def download_pdf_with_requests(url, filepath, internal_pn=None):
+    # URL is already rewritten in DownloadJob
     # If the URL does not end with .pdf, wait a few seconds before attempting to download
     if not url.lower().endswith('.pdf'):
-        logger.info(f"URL does not end with .pdf, waiting 5 seconds before downloading: {url}")
+        logger.warning(f"URL does not end with .pdf, waiting 5 seconds before downloading: {url}")
         time.sleep(5)
     """Download PDF with 403 error handling - matching main branch approach"""
     
-    # Random user agents for 403 protection
+    # More realistic, browser-like headers for 403 avoidance
     user_agents = [
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2.1 Safari/605.1.15',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0'
+        # Windows desktop browsers
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.112 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.112 Safari/537.36 Edg/125.0.2535.67',
+        # Mac desktop browsers
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5_2) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
+        # Mobile browsers
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+        'Mozilla/5.0 (Linux; Android 14; Pixel 7 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.112 Mobile Safari/537.36',
     ]
-    
+
+    # Modern browser headers (randomize User-Agent and some Sec-CH-UA values)
+    user_agent = random.choice(user_agents)
+    sec_ch_ua = '"Chromium";v="125", "Not.A/Brand";v="8", "Google Chrome";v="125"' if 'Chrome' in user_agent else '"Not.A/Brand";v="8", "Chromium";v="125"'
+    sec_ch_ua_mobile = '?1' if 'Mobile' in user_agent or 'iPhone' in user_agent or 'Android' in user_agent else '?0'
+    sec_ch_ua_platform = '"Windows"' if 'Windows' in user_agent else ('"macOS"' if 'Macintosh' in user_agent else ('"Android"' if 'Android' in user_agent else '"iOS"'))
+
     headers = {
-        'User-Agent': random.choice(user_agents),
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'User-Agent': user_agent,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9',
         'Accept-Language': 'en-US,en;q=0.9',
         'Accept-Encoding': 'gzip, deflate, br',
         'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
         'Referer': url,  # Some sites require a referer
         'Cache-Control': 'no-cache',
         'Pragma': 'no-cache',
         'DNT': '1',
+        'Upgrade-Insecure-Requests': '1',
         'Sec-Fetch-Dest': 'document',
         'Sec-Fetch-Mode': 'navigate',
         'Sec-Fetch-Site': 'none',
         'Sec-Fetch-User': '?1',
+        'Sec-CH-UA': sec_ch_ua,
+        'Sec-CH-UA-Mobile': sec_ch_ua_mobile,
+        'Sec-CH-UA-Platform': sec_ch_ua_platform,
     }
 
-    max_attempts = 3
 
-    # Fix protocol-relative URLs (starting with //)
-    if url.startswith('//'):
-        url = 'https:' + url
-    # URL encode spaces
-    url = url.replace(' ', '%20')
-
-    # Try to extract internal part number from the filepath if possible
-    def extract_internal_pn(filepath):
-        # Assumes filename format: datasheets/<internal_pn> ...
+    session = requests.Session()
+    session.headers.update(headers)
+    for attempt in range(MAX_ATTEMPTS):
         try:
-            base = os.path.basename(filepath)
-            return base.split(' ')[0]
-        except Exception:
-            return ''
-
-    internal_pn = extract_internal_pn(filepath)
-
-    for attempt in range(max_attempts):
-        try:
-            # Add random delay between attempts
-            if attempt > 0:
-                time.sleep(random.uniform(1.0, 3.0))
-            
-            # Make request with timeout and redirects
-            response = requests.get(url, headers=headers, timeout=30, allow_redirects=True, stream=True)
-            
-            # Handle 403 errors with exponential backoff and random delay
+            # Make request with timeout and redirects, using session for cookies
+            response = session.get(url, timeout=30, allow_redirects=True, stream=True)
+            # Handle 403 errors
             if response.status_code == 403:
-                if attempt < max_attempts - 1:
-                    wait_time = (2 ** attempt) + random.uniform(0, 2)  # Exponential backoff + random jitter
-                    logger.warning(f"[{internal_pn}] 403 Forbidden for URL: {url} (Attempt {attempt+1}/{max_attempts}) | Waiting {wait_time:.2f}s before retrying.")
-                    time.sleep(wait_time)
+                if attempt < MAX_ATTEMPTS - 1:
+                    logger.warning(f"[{internal_pn}] 403 Forbidden for URL: {url} (Attempt {attempt+1}/{MAX_ATTEMPTS}) | Retrying after crawl delay.")
                     continue
                 return False, "HTTP 403 Forbidden - Access denied after retries"
-            
             # Handle rate limiting
             elif response.status_code == 429:
-                if attempt < max_attempts - 1:
-                    time.sleep(5)
+                if attempt < MAX_ATTEMPTS - 1:
+                    logger.warning(f"[{internal_pn}] 429 Rate Limited for URL: {url} (Attempt {attempt+1}/{MAX_ATTEMPTS}) | Retrying after crawl delay.")
                     continue
-                return False, "HTTP 429 - Rate limited"
-            
+                logger.error(f"[{internal_pn}] 429 Rate Limited for URL: {url} (Final attempt). Raising RateLimitExceeded.")
+                raise RateLimitExceeded()
             elif response.status_code == 200:
                 # Download the content
                 content = b''
                 for chunk in response.iter_content(chunk_size=8192):
                     if chunk:
                         content += chunk
-                
                 # Verify it's a PDF and has reasonable size
                 if len(content) > 1000 and content.startswith(b'%PDF'):
                     with open(filepath, 'wb') as f:
@@ -151,26 +149,25 @@ def download_pdf_with_requests(url, filepath):
                     return False, "Unknown content issue"
             else:
                 return False, f"HTTP {response.status_code}"
-                
         except requests.exceptions.Timeout:
-            logger.warning(f"[{internal_pn}] Timeout when downloading {url} (Attempt {attempt+1}/{max_attempts})")
-            if attempt < max_attempts - 1:
+            logger.warning(f"[{internal_pn}] Timeout when downloading {url} (Attempt {attempt+1}/{MAX_ATTEMPTS})")
+            if attempt < MAX_ATTEMPTS - 1:
                 continue
             return False, "Request timeout after retries"
-        except requests.exceptions.ConnectionError:
-            logger.warning(f"[{internal_pn}] Connection error when downloading {url} (Attempt {attempt+1}/{max_attempts})")
-            if attempt < max_attempts - 1:
+        except requests.exceptions.ConnectionError as e:
+            logger.warning(f"[{internal_pn}] Connection error when downloading {url} (Attempt {attempt+1}/{MAX_ATTEMPTS}): {e}")
+            logger.error(f"Full connection error details for {url}:", exc_info=True)
+            if attempt < MAX_ATTEMPTS - 1:
                 continue
-            return False, "Connection error after retries"
+            return False, f"Connection error after retries: {e}"
         except requests.exceptions.RequestException as e:
             logger.warning(f"[{internal_pn}] Request exception for {url}: {e}")
-            if attempt < max_attempts - 1:
+            if attempt < MAX_ATTEMPTS - 1:
                 continue
             return False, f"Request error: {str(e)}"
         except Exception as e:
             logger.warning(f"[{internal_pn}] Unexpected error for {url}: {e}")
             return False, f"Download error: {str(e)}"
-    
     return False, "Failed after all retry attempts"
 
 class DownloadJob:
@@ -180,7 +177,14 @@ class DownloadJob:
         self.internal_pn = internal_pn
         self.manufacturer_pn = manufacturer_pn
         self.manufacturer_name = manufacturer_name
-        self.datasheet_url = datasheet_url
+        # Rewrite datasheet_url as early as possible
+        url = datasheet_url
+        if url:
+            if url.startswith('//'):
+                url = 'https:' + url
+            url = url.replace('onsemi.com', 'onsemi.cn')
+            url = url.replace(' ', '%20')
+        self.datasheet_url = url
         self.found_part = found_part
         self.manufacturer_found = manufacturer_found
         self.digikey_pn = digikey_pn
@@ -224,15 +228,15 @@ class APIWorker:
                     part_info = self.parts_queue.get(timeout=1)
                 except queue.Empty:
                     continue
-                
+
                 if part_info is None:
                     break
-                
+
                 internal_pn, manufacturer_pn, manufacturer_name = part_info
-                
+
                 if self.progress:
                     self.progress.update_worker_status(self.worker_id, "🔍", f"{internal_pn}")
-                
+
                 # Check if file already exists
                 filename = f"{internal_pn} {manufacturer_pn}.pdf"
                 filepath = os.path.join("datasheets", filename)
@@ -249,10 +253,15 @@ class APIWorker:
                     self.results_queue.put(result)
                     self.parts_queue.task_done()
                     continue
-                
+
                 # Search for part
-                product = self.search_part(manufacturer_pn)
-                
+                try:
+                    product = self.search_part(manufacturer_pn)
+                except RateLimitExceeded:
+                    logger.error("❌ RATE LIMIT EXCEEDED in APIWorker. Stopping worker.")
+                    self.is_running = False
+                    break
+
                 if not product:
                     result = {
                         'status': 'not_found',
@@ -281,7 +290,7 @@ class APIWorker:
                     else:
                         manufacturer_info = product.get('Manufacturer', {})
                         manufacturer_found = manufacturer_info.get('Name', 'Unknown') if isinstance(manufacturer_info, dict) else 'Unknown'
-                        
+
                         download_job = DownloadJob(
                             internal_pn=internal_pn,
                             manufacturer_pn=manufacturer_pn,
@@ -291,11 +300,13 @@ class APIWorker:
                             manufacturer_found=manufacturer_found,
                             digikey_pn=product.get('DigiKeyPartNumber', '')
                         )
-                        
+
                         self.download_queue.put(download_job)
-                
+
                 self.parts_queue.task_done()
-                
+
+            except RateLimitExceeded:
+                raise
             except Exception as e:
                 logger.warning(f"API worker error: {e}")
                 if 'part_info' in locals():
@@ -310,7 +321,6 @@ class APIWorker:
                         self.parts_queue.task_done()
                     except:
                         pass
-        
         if self.progress:
             self.progress.update_worker_status(self.worker_id, "⚪ Idle", "")
     
@@ -331,7 +341,7 @@ class APIWorker:
                 return True
             elif response.status_code == 429:
                 logger.error("❌ RATE LIMIT EXCEEDED!")
-                sys.exit(1)
+                raise RateLimitExceeded()
             else:
                 logger.error(f"❌ Authentication failed: HTTP {response.status_code}")
                 return False
@@ -385,7 +395,7 @@ class APIWorker:
                 return None
             elif response.status_code == 429:
                 logger.error("❌ RATE LIMIT EXCEEDED!")
-                sys.exit(1)
+                raise RateLimitExceeded()
             else:
                 return {'error': 'api_error', 'message': f'API returned {response.status_code}'}
                 
@@ -441,20 +451,22 @@ class DownloadWorker:
                     job = self.download_queue.get(timeout=1)
                 except queue.Empty:
                     continue
-                
                 if job is None:
                     break
-                
                 if self.progress:
-                    self.progress.update_worker_status(self.worker_id, "📥", f"{job.internal_pn}")
-                
+                    url_display = job.datasheet_url.replace('onsemi.com', 'onsemi.cn')
+                    if len(url_display) > 60:
+                        url_display = url_display[:57] + '...'
+                    self.progress.update_worker_status(
+                        self.worker_id,
+                        "📥",
+                        f"{job.internal_pn} | {url_display}"
+                    )
                 # Create filepath
                 os.makedirs("datasheets", exist_ok=True)
                 filepath = os.path.join("datasheets", job.filename)
-                
                 # Download with requests
-                success, message = download_pdf_with_requests(job.datasheet_url, filepath)
-                
+                success, message = download_pdf_with_requests(job.datasheet_url, filepath, job.internal_pn)
                 if success:
                     result = {
                         'status': 'success',
@@ -475,10 +487,8 @@ class DownloadWorker:
                         'url': job.datasheet_url,
                         'error': message
                     }
-                
                 self.results_queue.put(result)
                 self.download_queue.task_done()
-                
             except Exception as e:
                 logger.warning(f"Download worker error: {e}")
                 if 'job' in locals():
@@ -493,7 +503,6 @@ class DownloadWorker:
                         self.download_queue.task_done()
                     except:
                         pass
-        
         if self.progress:
             self.progress.update_worker_status(self.worker_id, "⚪ Idle", "")
 
@@ -514,15 +523,50 @@ class ProgressDisplay:
         }
         self.start_time = time.time()
         self.lock = threading.Lock()
-    
+        self.console = Console()
+        self._progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
+            TextColumn("[{task.percentage:>3.0f}%]"),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=self.console,
+            transient=False,
+            auto_refresh=False  # We'll refresh via Live
+        )
+        self._task_id = self._progress.add_task("Downloading", total=total_parts)
+        self._live = Live(self._render_group(), console=self.console, refresh_per_second=4, transient=False)
+        self._live.__enter__()  # Start live context
+
+    def _render_group(self):
+        # Results summary table
+        table = Table(title="Results Summary", show_header=True, header_style="bold magenta")
+        table.add_column("Status")
+        table.add_column("Count", justify="right")
+        table.add_row("✅ Downloaded", str(self.results['success']), style="green")
+        table.add_row("⏭️  Skipped", str(self.results['skipped']), style="cyan")
+        table.add_row("⚠️  No datasheet", str(self.results['no_datasheet']), style="yellow")
+        table.add_row("❌ Not found", str(self.results['not_found']), style="red")
+        table.add_row("⚠️  Download failed", str(self.results['download_failed']), style="yellow")
+        table.add_row("❌ Errors", str(self.results['error']), style="red")
+        # Worker status table
+        worker_table = Table(title="Workers", show_header=True, header_style="bold cyan")
+        worker_table.add_column("Worker ID")
+        worker_table.add_column("Status")
+        for worker_id, status in self.workers.items():
+            worker_table.add_row(worker_id, status)
+        return Group(self._progress, table, worker_table)
+
     def update_worker_status(self, worker_id, status, part_info):
         with self.lock:
             self.workers[worker_id] = f"{status} {part_info}".strip()
-    
+
     def update_progress(self, result):
         with self.lock:
             self.completed += 1
-            
+            self._progress.update(self._task_id, completed=self.completed)
             # Count result types
             status = result.get("status", "unknown")
             if result.get("skipped"):
@@ -531,55 +575,18 @@ class ProgressDisplay:
                 self.results[status] += 1
             else:
                 self.results["error"] += 1
-    
+
     def display(self):
         with self.lock:
-            # Calculate progress
-            percent = (self.completed / self.total_parts * 100) if self.total_parts > 0 else 0
-            elapsed = time.time() - self.start_time
-            
-            # Estimate time remaining
-            if self.completed > 0:
-                eta_seconds = (elapsed / self.completed) * (self.total_parts - self.completed)
-                eta = f"{int(eta_seconds//60)}:{int(eta_seconds%60):02d}"
-            else:
-                eta = "Unknown"
-            
-            # Progress bar
-            bar_width = 30
-            filled = int(bar_width * percent / 100)
-            bar = "█" * filled + "░" * (bar_width - filled)
-            
-            # Clear screen and display
-            logger.info("\033[H\033[J")  # Clear screen
-            logger.info(f"🚀 Progress:")
-            logger.info("=" * 50)
-            logger.info(f"{bar} {self.completed}/{self.total_parts} ({percent:.1f}%)")
-            logger.info(f"Elapsed: {int(elapsed//60)}:{int(elapsed%60):02d} | ETA: {eta}")
-            logger.info("")
-            
-            # Results summary
-            logger.info(f"  ✅ Downloaded: {self.results['success']}")
-            logger.info(f"  ⏭️  Skipped: {self.results['skipped']}")
-            logger.info(f"  ⚠️  No datasheet: {self.results['no_datasheet']}")
-            logger.info(f"  ❌ Not found: {self.results['not_found']}")
-            logger.info(f"  ⚠️  Download failed: {self.results['download_failed']}")
-            logger.info(f"  ❌ Errors: {self.results['error']}")
-            logger.info("")
-            
-            # Worker status
-            logger.info("Workers:")
-            logger.info("=" * 50)
-            for worker_id, status in self.workers.items():
-                logger.info(f"  {worker_id}: {status}")
-            
-            logger.info("")
-    
+            # Only update the live display in-place (no extra progress context)
+            self._live.update(self._render_group())
+
     def final_summary(self):
         elapsed = time.time() - self.start_time
         total = self.results['success'] + self.results['skipped']
-        logger.info(f"Total Downloaded: {total}")
-        logger.info(f"⏱️  Total time: {int(elapsed//60)}:{int(elapsed%60):02d}")
+        self._live.__exit__(None, None, None)  # End live context
+        self.console.print(f"[bold green]Total Downloaded:[/bold green] {total}")
+        self.console.print(f"[bold yellow]⏱️  Total time:[/bold yellow] {int(elapsed//60)}:{int(elapsed%60):02d}")
 
 def load_parts_from_csv(filename):
     """Load parts from CSV file"""
@@ -661,6 +668,8 @@ def save_results_to_csv(results, filename="datasheets/report.csv"):
             filename_or_url = result.get('filename', result.get('url', ''))
             if filename_or_url:
                 filename_or_url = filename_or_url.replace(' ', '%20')
+                # Also rewrite onsemi.com to onsemi.cn in the report output
+                filename_or_url = filename_or_url.replace('onsemi.com', 'onsemi.cn')
             writer.writerow([
                 status_text,
                 result.get('internal_pn', ''),
@@ -678,36 +687,36 @@ def main():
     if len(sys.argv) < 2:
         logger.error("❌ Usage: python script_new.py <parts_file.csv>")
         sys.exit(1)
-    
+
     parts_file = sys.argv[1]
-    
+
     # Check API keys
     if not API_KEYS:
         logger.error("❌ No API keys found! Please configure api_keys.json")
         sys.exit(1)
-    
+
     # Load parts
     parts = load_parts_from_csv(parts_file)
     if not parts:
         logger.error("❌ No parts to process!")
         sys.exit(1)
-    
+
     # Setup queues
     parts_queue = queue.Queue()
     download_queue = queue.Queue()
     results_queue = queue.Queue()
-    
+
     # Add parts to queue
     for part in parts:
         parts_queue.put(part)
-    
+
     # Setup progress display
     progress = ProgressDisplay(len(parts))
-    
+
     # Setup workers
     api_workers = []
     download_workers = []
-    
+
     # Create API workers
     for i in range(MAX_API_WORKERS):
         worker = APIWorker(
@@ -720,7 +729,7 @@ def main():
         )
         worker.set_parts_queue(parts_queue)
         api_workers.append(worker)
-    
+
     # Create download workers
     for i in range(MAX_WORKERS):
         worker = DownloadWorker(
@@ -730,51 +739,60 @@ def main():
             worker_id=f"DL-Worker-{i+1}"
         )
         download_workers.append(worker)
-    
+
     # Start workers
     logger.info("🚀 Starting datasheet downloader...")
     logger.info(f"⚙️  Settings: {MAX_API_WORKERS} API workers + {MAX_WORKERS} download workers")
-    
+
     for worker in api_workers:
         worker.start()
-    
+
     for worker in download_workers:
         worker.start()
-    
+
     # Collect results
     results = []
     completed = 0
-    
+    last_display = time.time()
     try:
         while completed < len(parts):
+            now = time.time()
             try:
                 result = results_queue.get(timeout=1)
                 results.append(result)
                 completed += 1
                 progress.update_progress(result)
                 progress.display()
+                last_display = now
             except queue.Empty:
+                # Update display at least once per second
+                if now - last_display >= 1.0:
+                    progress.display()
+                    last_display = now
                 continue
             except KeyboardInterrupt:
                 logger.info("⏹️  Shutdown requested...")
                 break
-    
+    except RateLimitExceeded:
+        logger.error("❌ Shutting down due to rate limit exceeded.")
+        for worker in api_workers:
+            worker.is_running = False
+        for worker in download_workers:
+            worker.is_running = False
+        return
     except KeyboardInterrupt:
         logger.info("⏹️  Shutdown requested...")
-    
-    # Stop workers
-    for worker in api_workers:
-        worker.stop()
-    
-    for worker in download_workers:
-        worker.stop()
-    
-    # Final summary
+    # Stop workers and save results on shutdown
+    try:
+        for worker in api_workers:
+            worker.stop()
+        for worker in download_workers:
+            worker.stop()
+    except KeyboardInterrupt:
+        print("\nShutdown interrupted. Exiting immediately.")
+        return
     progress.final_summary()
-    
-    # Save results
     save_results_to_csv(results)
-    
     logger.info("✅ Complete!")
 
 if __name__ == "__main__":
