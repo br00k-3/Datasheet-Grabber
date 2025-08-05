@@ -2,6 +2,9 @@
 datasheets/
 parts.csv
 
+# Log files
+report.log
+
 # API Keys - NEVER commit these!
 api_keys.json
 

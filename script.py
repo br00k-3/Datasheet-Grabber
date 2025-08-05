@@ -1,22 +1,40 @@
-import requests, os, json, time, random, threading, sys, difflib, csv, signal, queue, logging, shutil
-from urllib.parse import quote, urlparse
-from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
-#CONFIGURATION
-MAX_WORKERS = 5
+import requests, os, json, time, random, threading, sys, csv, queue, logging
+from datetime import datetime, timedelta
+
+# CONFIGURATION
+MAX_WORKERS = 3
 MAX_API_WORKERS = 1
 REQUESTS_PER_MINUTE = 120
 TIMEOUT_SECONDS = 30
-RESUME_ON_RESTART = True  
+RESUME_ON_RESTART = True
+LOGGING = True  # Enable logging to file
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
+class MaxLevelFilter(logging.Filter):
+    def __init__(self, level):
+        self.level = level
+    def filter(self, record):
+        return record.levelno < self.level
+
+for handler in logging.root.handlers[:]:
+    logging.root.removeHandler(handler)
+
+handlers = []
+
+stream_handler = logging.StreamHandler(sys.stdout)
+stream_handler.setLevel(logging.INFO)
+stream_handler.addFilter(MaxLevelFilter(logging.WARNING))  # Only show INFO and below in terminal
+stream_handler.setFormatter(logging.Formatter('%(message)s'))
+handlers.append(stream_handler)
+
+if LOGGING:  # Only add file handler if logging to file is enabled
+    file_handler = logging.FileHandler('report.log', mode='w', encoding='utf-8')
+    file_handler.setLevel(logging.WARNING)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    handlers.append(file_handler)
+
+logging.basicConfig(level=logging.INFO, handlers=handlers)
 logger = logging.getLogger(__name__)
-
 
 def load_api_keys():
     """Load API keys from external file"""
@@ -34,6 +52,10 @@ def load_api_keys():
 API_KEYS = load_api_keys()
 
 def download_pdf_with_requests(url, filepath):
+    # If the URL does not end with .pdf, wait a few seconds before attempting to download
+    if not url.lower().endswith('.pdf'):
+        logger.info(f"URL does not end with .pdf, waiting 5 seconds before downloading: {url}")
+        time.sleep(5)
     """Download PDF with 403 error handling - matching main branch approach"""
     
     # Random user agents for 403 protection
@@ -51,7 +73,15 @@ def download_pdf_with_requests(url, filepath):
         'Accept-Language': 'en-US,en;q=0.9',
         'Accept-Encoding': 'gzip, deflate, br',
         'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1'
+        'Upgrade-Insecure-Requests': '1',
+        'Referer': url,  # Some sites require a referer
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+        'DNT': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
     }
 
     max_attempts = 3
@@ -62,6 +92,17 @@ def download_pdf_with_requests(url, filepath):
     # URL encode spaces
     url = url.replace(' ', '%20')
 
+    # Try to extract internal part number from the filepath if possible
+    def extract_internal_pn(filepath):
+        # Assumes filename format: datasheets/<internal_pn> ...
+        try:
+            base = os.path.basename(filepath)
+            return base.split(' ')[0]
+        except Exception:
+            return ''
+
+    internal_pn = extract_internal_pn(filepath)
+
     for attempt in range(max_attempts):
         try:
             # Add random delay between attempts
@@ -71,10 +112,11 @@ def download_pdf_with_requests(url, filepath):
             # Make request with timeout and redirects
             response = requests.get(url, headers=headers, timeout=30, allow_redirects=True, stream=True)
             
-            # Handle 403 errors with exponential backoff
+            # Handle 403 errors with exponential backoff and random delay
             if response.status_code == 403:
                 if attempt < max_attempts - 1:
-                    wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                    wait_time = (2 ** attempt) + random.uniform(0, 2)  # Exponential backoff + random jitter
+                    logger.warning(f"[{internal_pn}] 403 Forbidden for URL: {url} (Attempt {attempt+1}/{max_attempts}) | Waiting {wait_time:.2f}s before retrying.")
                     time.sleep(wait_time)
                     continue
                 return False, "HTTP 403 Forbidden - Access denied after retries"
@@ -99,27 +141,34 @@ def download_pdf_with_requests(url, filepath):
                         f.write(content)
                     return True, "Downloaded successfully"
                 elif len(content) <= 1000:
+                    logger.warning(f"[{internal_pn}] Downloaded file too small for {url} (size: {len(content)} bytes)")
                     return False, "PDF content too small"
                 elif not content.startswith(b'%PDF'):
+                    logger.warning(f"[{internal_pn}] Downloaded file is not a valid PDF for {url}")
                     return False, "Response not a valid PDF"
                 else:
+                    logger.warning(f"[{internal_pn}] Unknown content issue for {url}")
                     return False, "Unknown content issue"
             else:
                 return False, f"HTTP {response.status_code}"
                 
         except requests.exceptions.Timeout:
+            logger.warning(f"[{internal_pn}] Timeout when downloading {url} (Attempt {attempt+1}/{max_attempts})")
             if attempt < max_attempts - 1:
                 continue
             return False, "Request timeout after retries"
         except requests.exceptions.ConnectionError:
+            logger.warning(f"[{internal_pn}] Connection error when downloading {url} (Attempt {attempt+1}/{max_attempts})")
             if attempt < max_attempts - 1:
                 continue
             return False, "Connection error after retries"
         except requests.exceptions.RequestException as e:
+            logger.warning(f"[{internal_pn}] Request exception for {url}: {e}")
             if attempt < max_attempts - 1:
                 continue
             return False, f"Request error: {str(e)}"
         except Exception as e:
+            logger.warning(f"[{internal_pn}] Unexpected error for {url}: {e}")
             return False, f"Download error: {str(e)}"
     
     return False, "Failed after all retry attempts"
@@ -135,7 +184,10 @@ class DownloadJob:
         self.found_part = found_part
         self.manufacturer_found = manufacturer_found
         self.digikey_pn = digikey_pn
-        self.filename = (f"{internal_pn} {manufacturer_pn}") + ".pdf"
+        # Sanitize filename: replace / and \ with %20
+        safe_internal_pn = str(internal_pn).replace('/', '%20').replace('\\', '%20')
+        safe_manufacturer_pn = str(manufacturer_pn).replace('/', '%20').replace('\\', '%20')
+        self.filename = f"{safe_internal_pn} {safe_manufacturer_pn}.pdf"
 
 class APIWorker:
     def __init__(self, downloader, download_queue, results_queue, progress, api_key, worker_id="API-Worker"):
@@ -245,6 +297,7 @@ class APIWorker:
                 self.parts_queue.task_done()
                 
             except Exception as e:
+                logger.warning(f"API worker error: {e}")
                 if 'part_info' in locals():
                     result = {
                         'status': 'error',
@@ -427,6 +480,7 @@ class DownloadWorker:
                 self.download_queue.task_done()
                 
             except Exception as e:
+                logger.warning(f"Download worker error: {e}")
                 if 'job' in locals():
                     result = {
                         'status': 'download_failed',
@@ -523,17 +577,9 @@ class ProgressDisplay:
     
     def final_summary(self):
         elapsed = time.time() - self.start_time
-        logger.info("\n" + "=" * 50)
-        logger.info("📊 FINAL SUMMARY")
-        logger.info("=" * 50)
-        logger.info(f"✅ Downloaded: {self.results['success']}")
-        logger.info(f"⏭️  Skipped: {self.results['skipped']}")
-        logger.info(f"⚠️  No datasheet: {self.results['no_datasheet']}")
-        logger.info(f"❌ Not found: {self.results['not_found']}")
-        logger.info(f"⚠️  Download failed: {self.results['download_failed']}")
-        logger.info(f"❌ Errors: {self.results['error']}")
+        total = self.results['success'] + self.results['skipped']
+        logger.info(f"Total Downloaded: {total}")
         logger.info(f"⏱️  Total time: {int(elapsed//60)}:{int(elapsed%60):02d}")
-        logger.info("=" * 50)
 
 def load_parts_from_csv(filename):
     """Load parts from CSV file"""
