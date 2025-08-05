@@ -477,6 +477,7 @@ class DigiKeyDownloader:
         self.acquisition_history = {}
         self.rate_limiter = SimpleRateLimiter(REQUESTS_PER_MINUTE)
         self.session_lock = threading.Lock()
+        self.last_download_error = None  # Store detailed error messages for failed downloads
         
         # Load manufacturer database
         self._load_manufacturers()
@@ -828,13 +829,56 @@ class DigiKeyDownloader:
         
         return None
     
+    def _fix_malformed_url(self, url):
+        """Fix common URL malformations and encode special characters"""
+        if not url:
+            return url
+            
+        # Fix protocol-relative URLs (starting with //)
+        if url.startswith('//'):
+            url = 'https:' + url
+            
+        # Fix URLs missing protocol entirely
+        elif not url.startswith(('http://', 'https://')):
+            if url.startswith('www.') or '.' in url:
+                url = 'https://' + url
+        
+        # URL encode special characters, but preserve the scheme and domain
+        if '://' in url:
+            scheme_and_domain, path = url.split('://', 1)
+            if '/' in path:
+                domain, path_part = path.split('/', 1)
+                # Only encode the path part, not the domain
+                # Use quote with safe characters to preserve slashes and other URL structure
+                encoded_path = quote(path_part, safe='/:@!$&\'()*+,;=?#[]')
+                url = f"{scheme_and_domain}://{domain}/{encoded_path}"
+            else:
+                # No path, just domain
+                url = f"{scheme_and_domain}://{path}"
+                
+        return url
+    
+
+    
     def _generate_part_variations(self, part_number):
         """Return the original part number as-is without variations"""
         return [part_number]
     def download_datasheet(self, url, filename, output_dir):
         """Download a datasheet PDF with enhanced timeout handling and minimal headers strategy"""
+        # Reset last error message and store the fixed URL
+        self.last_download_error = None
+        self.last_fixed_url = url  # Store original URL initially
+        
         if not url:
+            self.last_download_error = "Missing URL"
             return False
+        
+        # Fix malformed URLs
+        original_url = url
+        url = self._fix_malformed_url(url)
+        self.last_fixed_url = url  # Store the fixed URL
+        if url != original_url:
+            logger.debug(f"🔧 Fixed malformed URL: {original_url} -> {url}")
         
         os.makedirs(output_dir, exist_ok=True)
         filepath = os.path.join(output_dir, filename)
@@ -905,8 +949,12 @@ class DigiKeyDownloader:
                         # If we got 403 with headers, wait longer and try again
                         time.sleep(2 ** attempt)  # Exponential backoff
                         continue
+                    logger.debug(f"🔍 403 Forbidden for {filename} after {max_attempts} attempts")
                     return False
                 elif response.status_code == 429:
+                    if attempt == max_attempts - 1:
+                        logger.debug(f"🔍 Rate limited for {filename} after {max_attempts} attempts")
+                        return False
                     time.sleep(5)
                     continue
                 
@@ -915,19 +963,8 @@ class DigiKeyDownloader:
                 # Check if it's actually a PDF
                 content_type = response.headers.get('content-type', '').lower()
                 if 'html' in content_type:
-                    # Try to extract PDF URL from HTML
-                    pdf_patterns = [
-                        r'https?://[^"\s]+\.pdf[^"\s]*',
-                        r'window\.viewerPdfUrl\s*=\s*[\'"]([^\'"]+)[\'"]',
-                    ]
-                    
-                    html_content = response.text
-                    for pattern in pdf_patterns:
-                        matches = re.findall(pattern, html_content, re.IGNORECASE)
-                        if matches:
-                            extracted_url = matches[0]
-                            if extracted_url != url:
-                                return self.download_datasheet(extracted_url, filename, output_dir)
+                    # Store error message for HTML responses
+                    self.last_download_error = f"Got HTML instead of PDF: {content_type}"
                     return False
                 
                 # Download the file with timeout protection
@@ -943,21 +980,40 @@ class DigiKeyDownloader:
                             f.write(chunk)
                 
                 # Validate it's a PDF
-                with open(filepath, 'rb') as f:
-                    if f.read(4) != b'%PDF':
+                try:
+                    with open(filepath, 'rb') as f:
+                        header = f.read(4)
+                        if header != b'%PDF':
+                            # Check what we actually got
+                            file_size = os.path.getsize(filepath)
+                            self.last_download_error = f"Invalid PDF content: got {header[:4]} instead of %PDF (size: {file_size} bytes)"
+                            os.remove(filepath)
+                            return False
+                except Exception as e:
+                    self.last_download_error = f"PDF validation error: {str(e)}"
+                    if os.path.exists(filepath):
                         os.remove(filepath)
-                        return False
+                    return False
                 
                 return True
                 
             except (requests.exceptions.Timeout, requests.exceptions.ConnectTimeout, 
-                    requests.exceptions.ReadTimeout, OSError, ConnectionError):
-                # Silent retry on timeout
+                    requests.exceptions.ReadTimeout, OSError, ConnectionError) as e:
+                # Store timeout errors for detailed reporting
                 if attempt == max_attempts - 1:
+                    self.last_download_error = f"Timeout error: {type(e).__name__}"
                     return False
                 time.sleep(2)
-            except Exception:
+            except requests.exceptions.HTTPError as e:
+                # Store HTTP errors for detailed reporting
                 if attempt == max_attempts - 1:
+                    self.last_download_error = f"HTTP error: {e.response.status_code}"
+                    return False
+                time.sleep(1)
+            except Exception as e:
+                # Store unexpected errors for detailed reporting
+                if attempt == max_attempts - 1:
+                    self.last_download_error = f"{type(e).__name__}: {str(e)}"
                     return False
                 time.sleep(1)
         
@@ -984,6 +1040,9 @@ class DigiKeyDownloader:
                     filepath = os.path.join("datasheets", job.filename)
                     try:
                         if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                            # Get the fixed URL for consistency in reporting
+                            actual_url = self._fix_malformed_url(job.datasheet_url)
+                            
                             result = {
                                 'status': 'success',
                                 'internal_pn': job.internal_pn,
@@ -992,7 +1051,7 @@ class DigiKeyDownloader:
                                 'manufacturer': job.manufacturer_found,
                                 'digikey_pn': job.digikey_pn,
                                 'filename': job.filename,
-                                'url': job.datasheet_url,
+                                'url': actual_url,
                                 'skipped': True
                             }
                             results_queue.put(result)
@@ -1004,6 +1063,9 @@ class DigiKeyDownloader:
                 
                 # Download the datasheet
                 success = self.download_datasheet(job.datasheet_url, job.filename, "datasheets")
+                
+                # Get the fixed URL that was actually used for download
+                actual_url = getattr(self, 'last_fixed_url', job.datasheet_url)
                 
                 if success:
                     if progress:
@@ -1017,12 +1079,16 @@ class DigiKeyDownloader:
                         'manufacturer': job.manufacturer_found,
                         'digikey_pn': job.digikey_pn,
                         'filename': job.filename,
-                        'url': job.datasheet_url
+                        'url': actual_url
                     }
                     results_queue.put(result)
                 else:
                     if progress:
                         progress.update_worker_status(worker_id, "⚠️ Download failed", f"{job.internal_pn}")
+                    
+                    # Get detailed error message if available
+                    error_detail = getattr(self, 'last_download_error', None)
+                    error_message = f"Download failed: {error_detail}" if error_detail else 'Part found but download blocked (try manual download from URL)'
                     
                     result = {
                         'status': 'download_failed',
@@ -1030,8 +1096,8 @@ class DigiKeyDownloader:
                         'manufacturer_pn': job.manufacturer_pn,
                         'found_part': job.found_part,
                         'manufacturer': job.manufacturer_found,
-                        'url': job.datasheet_url,
-                        'message': 'Part found but download blocked (try manual download from URL)'
+                        'url': actual_url,
+                        'message': error_message
                     }
                     results_queue.put(result)
                 
@@ -1151,6 +1217,10 @@ class DigiKeyDownloader:
                 else:
                     manufacturer_name_extracted = str(manufacturer_info) if manufacturer_info else 'Unknown'
                 
+                # Get detailed error message if available
+                error_detail = getattr(self.downloader, 'last_download_error', None)
+                error_message = f"Download failed: {error_detail}" if error_detail else 'Part found but download blocked (try manual download from URL)'
+                
                 return {
                     'status': 'download_failed',
                     'internal_pn': internal_pn,
@@ -1158,7 +1228,7 @@ class DigiKeyDownloader:
                     'found_part': product.get('ManufacturerPartNumber', manufacturer_pn),
                     'manufacturer': manufacturer_name_extracted,
                     'url': datasheet_url,
-                    'message': 'Part found but download blocked (try manual download from URL)'
+                    'message': error_message
                 }
                 
         except Exception as e:
@@ -1270,7 +1340,9 @@ class DigiKeyDownloader:
             for item in results['download_failed']:
                 # Use the datasheet URL instead of filename for failed downloads
                 url = item.get('url', '')
-                f.write(f"Download Failed,{item['internal_pn']},\"{item['manufacturer_pn']}\",\"{item.get('found_part', '')}\",{item.get('manufacturer', '')},\"{url}\",Manual download required\n")
+                # Use detailed error message from the result
+                error_message = item.get('message', 'Manual download required')
+                f.write(f"Download Failed,{item['internal_pn']},\"{item['manufacturer_pn']}\",\"{item.get('found_part', '')}\",{item.get('manufacturer', '')},\"{url}\",{error_message}\n")
             
             for item in results['errors']:
                 error_msg = item.get('error', 'Unknown error')
