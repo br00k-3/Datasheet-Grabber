@@ -1,8 +1,0 @@
-{
-  "api_keys": [
-    {
-      "CLIENT_ID": "your_digikey_client_id_here",
-      "CLIENT_SECRET": "your_digikey_client_secret_here"
-    }
-  ]
-}
