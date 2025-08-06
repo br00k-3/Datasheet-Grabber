@@ -37,7 +37,11 @@ stream_handler.setFormatter(logging.Formatter('%(message)s'))
 handlers.append(stream_handler)
 
 if LOGGING:  # Only add file handler if logging to file is enabled
-    file_handler = logging.FileHandler('report.log', mode='w', encoding='utf-8')
+    os.makedirs('reports', exist_ok=True)
+    now = datetime.now()
+    timestamp = now.strftime('%Y-%m-%d %H-%M-%S')
+    log_filename = f'reports/{timestamp}_report.log'
+    file_handler = logging.FileHandler(log_filename, mode='w', encoding='utf-8')
     file_handler.setLevel(logging.WARNING)
     file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
     handlers.append(file_handler)
@@ -111,63 +115,63 @@ def download_pdf_with_requests(url, filepath, internal_pn=None):
     session = requests.Session()
     session.headers.update(headers)
     for attempt in range(MAX_ATTEMPTS):
+        response = None
         try:
-            # Make request with timeout and redirects, using session for cookies
-            response = session.get(url, timeout=30, allow_redirects=True, stream=True)
-            # Handle 403 errors
-            if response.status_code == 403:
+            # Try with SSL verification
+            response = session.get(url, timeout=30, allow_redirects=True, stream=True, verify=True)
+        except requests.exceptions.SSLError as ssl_err:
+            logger.warning(f"[{internal_pn}] SSL error for {url} (Attempt {attempt+1}/{MAX_ATTEMPTS}): {ssl_err}. Retrying without certificate verification.")
+            try:
+                response = session.get(url, timeout=30, allow_redirects=True, stream=True, verify=False)
+            except Exception as e:
+                logger.warning(f"[{internal_pn}] Failed to download {url} without SSL verification: {e}")
                 if attempt < MAX_ATTEMPTS - 1:
-                    logger.warning(f"[{internal_pn}] 403 Forbidden for URL: {url} (Attempt {attempt+1}/{MAX_ATTEMPTS}) | Retrying after crawl delay.")
                     continue
-                return False, "HTTP 403 Forbidden - Access denied after retries"
-            # Handle rate limiting
-            elif response.status_code == 429:
-                if attempt < MAX_ATTEMPTS - 1:
-                    logger.warning(f"[{internal_pn}] 429 Rate Limited for URL: {url} (Attempt {attempt+1}/{MAX_ATTEMPTS}) | Retrying after crawl delay.")
-                    continue
-                logger.error(f"[{internal_pn}] 429 Rate Limited for URL: {url} (Final attempt). Raising RateLimitExceeded.")
-                raise RateLimitExceeded()
-            elif response.status_code == 200:
-                # Download the content
-                content = b''
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        content += chunk
-                # Verify it's a PDF and has reasonable size
-                if len(content) > 1000 and content.startswith(b'%PDF'):
-                    with open(filepath, 'wb') as f:
-                        f.write(content)
-                    return True, "Downloaded successfully"
-                elif len(content) <= 1000:
-                    logger.warning(f"[{internal_pn}] Downloaded file too small for {url} (size: {len(content)} bytes)")
-                    return False, "PDF content too small"
-                elif not content.startswith(b'%PDF'):
-                    logger.warning(f"[{internal_pn}] Downloaded file is not a valid PDF for {url}")
-                    return False, "Response not a valid PDF"
-                else:
-                    logger.warning(f"[{internal_pn}] Unknown content issue for {url}")
-                    return False, "Unknown content issue"
-            else:
-                return False, f"HTTP {response.status_code}"
-        except requests.exceptions.Timeout:
-            logger.warning(f"[{internal_pn}] Timeout when downloading {url} (Attempt {attempt+1}/{MAX_ATTEMPTS})")
-            if attempt < MAX_ATTEMPTS - 1:
-                continue
-            return False, "Request timeout after retries"
-        except requests.exceptions.ConnectionError as e:
-            logger.warning(f"[{internal_pn}] Connection error when downloading {url} (Attempt {attempt+1}/{MAX_ATTEMPTS}): {e}")
-            logger.error(f"Full connection error details for {url}:", exc_info=True)
-            if attempt < MAX_ATTEMPTS - 1:
-                continue
-            return False, f"Connection error after retries: {e}"
-        except requests.exceptions.RequestException as e:
-            logger.warning(f"[{internal_pn}] Request exception for {url}: {e}")
-            if attempt < MAX_ATTEMPTS - 1:
-                continue
-            return False, f"Request error: {str(e)}"
+                return False, f"SSL error: {ssl_err} | Fallback failed: {e}"
         except Exception as e:
             logger.warning(f"[{internal_pn}] Unexpected error for {url}: {e}")
+            if attempt < MAX_ATTEMPTS - 1:
+                continue
             return False, f"Download error: {str(e)}"
+
+        if response is None:
+            continue
+
+        # Handle 403 errors
+        if response.status_code == 403:
+            if attempt < MAX_ATTEMPTS - 1:
+                logger.warning(f"[{internal_pn}] 403 Forbidden for URL: {url} (Attempt {attempt+1}/{MAX_ATTEMPTS}) | Retrying after crawl delay.")
+                continue
+            return False, "HTTP 403 Forbidden - Access denied after retries"
+        # Handle rate limiting
+        elif response.status_code == 429:
+            if attempt < MAX_ATTEMPTS - 1:
+                logger.warning(f"[{internal_pn}] 429 Rate Limited for URL: {url} (Attempt {attempt+1}/{MAX_ATTEMPTS}) | Retrying after crawl delay.")
+                continue
+            logger.error(f"[{internal_pn}] 429 Rate Limited for URL: {url} (Final attempt). Raising RateLimitExceeded.")
+            raise RateLimitExceeded()
+        elif response.status_code == 200:
+            # Download the content
+            content = b''
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    content += chunk
+            # Verify it's a PDF and has reasonable size
+            if len(content) > 1000 and content.startswith(b'%PDF'):
+                with open(filepath, 'wb') as f:
+                    f.write(content)
+                return True, "Downloaded successfully"
+            elif len(content) <= 1000:
+                logger.warning(f"[{internal_pn}] Downloaded file too small for {url} (size: {len(content)} bytes)")
+                return False, "PDF content too small"
+            elif not content.startswith(b'%PDF'):
+                logger.warning(f"[{internal_pn}] Downloaded file is not a valid PDF for {url}")
+                return False, "Response not a valid PDF"
+            else:
+                logger.warning(f"[{internal_pn}] Unknown content issue for {url}")
+                return False, "Unknown content issue"
+        else:
+            return False, f"HTTP {response.status_code}"
     return False, "Failed after all retry attempts"
 
 class DownloadJob:
@@ -188,9 +192,9 @@ class DownloadJob:
         self.found_part = found_part
         self.manufacturer_found = manufacturer_found
         self.digikey_pn = digikey_pn
-        # Sanitize filename: replace / and \ with %20
-        safe_internal_pn = str(internal_pn).replace('/', '%20').replace('\\', '%20')
-        safe_manufacturer_pn = str(manufacturer_pn).replace('/', '%20').replace('\\', '%20')
+        # Sanitize filename: replace / with %2F and \ with %5C (standard URL encoding)
+        safe_internal_pn = str(internal_pn).replace('/', '%2F').replace('\\', '%5C')
+        safe_manufacturer_pn = str(manufacturer_pn).replace('/', '%2F').replace('\\', '%5C')
         self.filename = f"{safe_internal_pn} {safe_manufacturer_pn}.pdf"
 
 class APIWorker:
@@ -238,21 +242,39 @@ class APIWorker:
                     self.progress.update_worker_status(self.worker_id, "🔍", f"{internal_pn}")
 
                 # Check if file already exists
-                filename = f"{internal_pn} {manufacturer_pn}.pdf"
+                # Use standard encoding for filename matching
+                safe_internal_pn = str(internal_pn).replace('/', '%2F').replace('\\', '%5C')
+                safe_manufacturer_pn = str(manufacturer_pn).replace('/', '%2F').replace('\\', '%5C')
+                filename = f"{safe_internal_pn} {safe_manufacturer_pn}.pdf"
                 filepath = os.path.join("datasheets", filename)
-                if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
-                    result = {
-                        'status': 'success',
-                        'internal_pn': internal_pn,
-                        'manufacturer_pn': manufacturer_pn,
-                        'found_part': manufacturer_pn,
-                        'manufacturer': 'Unknown',
-                        'filename': filename,
-                        'skipped': True
-                    }
-                    self.results_queue.put(result)
-                    self.parts_queue.task_done()
-                    continue
+                if os.path.exists(filepath):
+                    try:
+                        with open(filepath, 'rb') as f:
+                            header = f.read(4)
+                            f.seek(0, 2)
+                            size = f.tell()
+                        if header == b'%PDF' and size > 1000:
+                            result = {
+                                'status': 'success',
+                                'internal_pn': internal_pn,
+                                'manufacturer_pn': manufacturer_pn,
+                                'found_part': manufacturer_pn,
+                                'manufacturer': 'Unknown',
+                                'filename': filename,
+                                'skipped': True
+                            }
+                            self.results_queue.put(result)
+                            self.parts_queue.task_done()
+                            continue
+                        else:
+                            # Not a valid PDF, delete and re-download
+                            os.remove(filepath)
+                    except Exception as e:
+                        logger.warning(f"Error checking PDF validity for {filepath}: {e}")
+                        try:
+                            os.remove(filepath)
+                        except Exception:
+                            pass
 
                 # Search for part
                 try:
@@ -608,10 +630,16 @@ def load_parts_from_csv(filename):
         logger.error(f"❌ Error loading parts: {e}")
         return []
 
-def save_results_to_csv(results, filename="datasheets/report.csv"):
+def save_results_to_csv(results, filename=None):
     """Save results to CSV report, organized by status then internal P/N"""
-    os.makedirs("datasheets", exist_ok=True)
-    
+    os.makedirs("reports", exist_ok=True)
+
+    # Generate filename with current time if not provided
+    if filename is None:
+        now = datetime.now()
+        timestamp = now.strftime('%Y-%m-%d %H-%M-%S')
+        filename = f"reports/{timestamp}_report.csv"
+
     # Define status priority for sorting (successful results first)
     status_priority = {
         'success': 1,
@@ -622,7 +650,6 @@ def save_results_to_csv(results, filename="datasheets/report.csv"):
         'error': 6,
         'unknown': 7
     }
-    
     # Sort results by status priority, then by internal P/N
     def sort_key(result):
         status = result.get('status', 'unknown')
@@ -632,13 +659,13 @@ def save_results_to_csv(results, filename="datasheets/report.csv"):
         priority = status_priority.get(status, 7)
         internal_pn = result.get('internal_pn', '').upper()  # Case-insensitive sort
         return (priority, internal_pn)
-    
+
     sorted_results = sorted(results, key=sort_key)
-    
+
     with open(filename, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow(["Status", "Internal P/N", "Manufacturer P/N", "Found Part", "Manufacturer", "Filename/URL", "Notes"])
-        
+
         for result in sorted_results:
             status = result.get('status', 'unknown')
             if result.get('skipped'):
@@ -663,7 +690,7 @@ def save_results_to_csv(results, filename="datasheets/report.csv"):
                 notes = result.get('error', 'Unknown error')
                 # Clean up error message - remove extra newlines and normalize whitespace
                 notes = ' '.join(notes.split())
-            
+
             # Ensure URLs and filenames have spaces replaced with %20 for consistency
             filename_or_url = result.get('filename', result.get('url', ''))
             if filename_or_url:
@@ -679,7 +706,7 @@ def save_results_to_csv(results, filename="datasheets/report.csv"):
                 filename_or_url,
                 notes
             ])
-    
+
     logger.info(f"📄 Report saved: {filename}")
 
 def main():
