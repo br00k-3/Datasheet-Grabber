@@ -1,26 +1,67 @@
-# 🚀 DigiKey Datasheet Downloader
+# Datasheet Grabber
 
-**Clean, professional tool to automatically download datasheets for electronic components from DigiKey.**
+A robust, multi-threaded Python tool for automatically searching, downloading, and reporting datasheets for electronic parts. Designed for reliability, anti-bot evasion, and user-friendly progress display.
 
-## ✨ Features
+## Features
 
-- 📊 **Real-time progress** with ETA and worker status indicators
-- 🔄 **Auto-resume** - skips existing files, handles interruptions gracefully
-- 🛡️ **Process protection** - prevents multiple instances from running
-- 🎯 **Smart manufacturer matching** - fuzzy matching with 5,881+ manufacturers
-- 📄 **CSV support** - automatic column detection for spreadsheets
-- ⚡ **Parallel processing** - configurable workers for optimal speed
-- 🔒 **Built-in protections** - rate limiting, timeout handling, clean shutdown
+- **Multi-threaded**: Fast, concurrent downloads and API lookups.
+- **Per-domain crawl delay**: Respects vendor rate limits and robots.txt.
+- **Realistic browser headers**: Avoids 403/429 errors by mimicking real browsers.
+- **Persistent cookies**: Uses sessions for better anti-bot evasion.
+- **Graceful shutdown**: Handles rate limits and user interrupts cleanly.
+- **Rich progress display**: Beautiful, live-updating terminal UI with per-worker status.
+- **Detailed CSV report**: Results are saved and sorted for easy review.
 
----
-
-## 🚀 Quick Start
-
-### 1. Setup API Keys
-```bash
-cp api_keys.json.template api_keys.json
-# Edit api_keys.json with your DigiKey API credentials
+## Example
 ```
+$ py script.py parts.csv
+Loaded 329 parts from parts.csv
+🚀 Starting datasheet downloader...
+⚙️  Settings: 1 API workers + 5 download workers
+  Downloading ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 329/329 [100%] 0:01:28 0:00:00
+     Results Summary        
+┏━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━┓
+┃ Status               ┃ Count ┃
+┡━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━┩
+│ ✅ Downloaded        │     0 │
+│ ⏭️ Skipped           │   174 │
+│ ⚠️ No datasheet      │     3 │
+│ ❌ Not found         │   116 │
+│ ⚠️ Download failed   │    36 │
+│ ❌ Errors            │     0 │
+└──────────────────────┴───────┘
+                                      Workers                                 
+┏━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ Worker ID    ┃ Status                                                                     ┃
+┡━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ API-Worker-1 │ 🔍 R001                                                                    │
+│ DL-Worker-3  │ 📥 R001 | https://www.example.com/datasheets/R001                          │
+│ DL-Worker-2  │ 📥 R002 | https://www.example.com/datasheets/R002                          │
+│ DL-Worker-4  │ 📥 R003 | https://www.example.com/datasheets/R003                          │
+│ DL-Worker-1  │ 📥 R004 | https://www.example.com/datasheets/R004                          │
+│ DL-Worker-5  │ 📥 R005 | https://www.example.com/datasheets/R005                          │
+└──────────────┴────────────────────────────────────────────────────────────────────────────┘
+Total Downloaded: 174
+⏱️  Total time: 1:31
+📄 Report saved: reports/2025-08-07 14-06-55_report.csv
+✅ Complete!
+```
+
+## Requirements
+
+- Python 3.8+
+- `requests`
+- `rich`
+
+Install dependencies:
+
+```
+pip install -r requirements.txt
+```
+
+## Setup
+
+1. **API Keys**: Create an `api_keys.json` file in the project root:
 
 ```json
 {
@@ -33,128 +74,73 @@ cp api_keys.json.template api_keys.json
 }
 ```
 
-### 2. Create Parts List
-
-**CSV Format (Recommended)** - Create `parts_list.csv`:
-```csv
-Item Number,Mfr. Part Number,Mfr. Name
-R001,RC0603FR-071KL,Yageo
-C001,GRM188R71H104KA93D,Murata
-U001,STM32F407VGT6,STMicroelectronics
-```
-
-**Text Format** - Create `parts_list.txt`:
-```
-# Format: [Internal P/N] [Manufacturer P/N] [Manufacturer]
-R001    RC0603FR-071KL      Yageo
-C001    GRM188R71H104KA93D  Murata
-U001    STM32F407VGT6       STMicroelectronics
-```
-
-### 3. Run the Script
-```bash
-python3 script.py
-```
-
-### 4. View Results
-- 📁 PDFs saved to `datasheets/` directory
-- 📊 Detailed report in `datasheets/report.csv`
-- ✅ Auto-resumes on restart
-
----
-
-## ⚙️ Configuration
-
-### Performance Settings
-Edit the top of `script.py` to customize:
-
-```python
-MAX_WORKERS = 3         # Parallel downloads (1-5 recommended)
-REQUESTS_PER_MINUTE = 15  # Rate limit to avoid blocks
-TIMEOUT_SECONDS = 30    # Request timeout
-RESUME_ON_RESTART = True    # Skip existing files
-```
-
-### Multiple API Keys (Optional)
-For higher throughput, add multiple API keys:
-
-```json
-{
-  "api_keys": [
-    {
-      "CLIENT_ID": "first_client_id",
-      "CLIENT_SECRET": "first_client_secret"
-    },
-    {
-      "CLIENT_ID": "second_client_id", 
-      "CLIENT_SECRET": "second_client_secret"
-    }
-  ]
-}
-```
-
----
-
-## 📊 Example Output
+2. **Parts List**: Prepare a CSV file (e.g., `parts.csv`) with columns:
 
 ```
-🚀 DigiKey Datasheet Downloader
-==================================================
-📚 Loaded 5,881 manufacturers
-📋 Found 200 parts to process
-⚙️  Settings: 3 workers, 15 req/min
-⏱️  Estimated time: 4.4 minutes
-💡 Press Ctrl+C to stop safely at any time
-==================================================
-🔐 Authenticating with DigiKey...
-✅ Authentication successful!
-
-[████████████████████████████████] 185/200 (92.5%) | ETA: 0:23 | Workers: 🔍 📥 ✅ | ✅ Downloaded R185
-
-✅ Completed in 8:42
-
-==================================================
-📊 SUMMARY
-==================================================
-✅ Downloaded: 185
-⚠️  No datasheet: 8
-❌ Not found: 5  
-⚠️  Download failed: 2
-❌ Errors: 0
-📄 Report saved: datasheets/report.csv
+Internal P/N,Manufacturer,Manufacturer P/N
+190.0015,ON Semiconductor,1N5235B
+...
 ```
+
+## Usage
+
+Run the script with your parts file:
+
+```
+python script.py parts.csv
+```
+
+- Progress and worker status will be shown in the terminal.
+- Results are saved to `datasheets/report.csv`.
+- Downloaded PDFs are saved in the `datasheets/` folder.
+- Errors and warnings are logged to `report.log`.
+
+## Customization
+
+- **Crawl Delays**: Edit `CRAWL_DELAY_PER_DOMAIN` and `CRAWL_DELAY_DEFAULT` in `script.py`.
+- **Worker Counts**: Adjust `MAX_WORKERS` and `MAX_API_WORKERS` in `script.py`.
+
+## Troubleshooting
+
+- If you see 403/429 errors, check your API keys and try increasing crawl delays.
+- If the display is glitchy, try resizing your terminal or using a different terminal emulator.
+- For debugging, check `report.log` for detailed error messages.
+
+## License
+
+MIT License. See `LICENSE` file for details.
+
+
+*Created by br00k-3. Contributions welcome!*
+
+## 📋 Report Format
+
+The `datasheets/report.csv` is organized by status priority:
+
+| Status | Description | Action Required |
+|--------|-------------|-----------------|
+| **Success** | ✅ Downloaded successfully | None - files in `datasheets/` |
+| **No Datasheet** | ⚠️ Part found but no PDF available | Contact manufacturer |
+| **Not Found** | ❌ Part not in DigiKey database | Verify part number/manufacturer |
+| **Download Failed** | ⚠️ PDF blocked or inaccessible | Manual download from URL |
+| **Error** | ❌ API or network issues | Check connection/API keys |
 
 ## 🔧 Troubleshooting
 
-| Issue | Solution |
-|-------|----------|
-| **High failure rate** | Lower `REQUESTS_PER_MINUTE` to 10-12 |
-| **Timeouts** | Increase `TIMEOUT_SECONDS` to 45-60 |
-| **Multiple instances** | Script prevents this automatically |
-| **Interrupted download** | Just restart - auto-resumes from where it left off |
-| **Need speed** | Increase `MAX_WORKERS` to 3-5 (watch rate limits) |
-
-## 🛡️ Built-in Safety Features
-
-- **Process locking** - Prevents multiple script instances
-- **Rate limiting** - Respects DigiKey's API limits  
-- **Smart retries** - Handles temporary failures gracefully
-- **Timeout protection** - Prevents hanging on problematic downloads
-- **Clean shutdown** - Ctrl+C stops safely without data corruption
-- **PDF validation** - Ensures downloaded files are valid
-
-## 📄 Report Details
-
-The `datasheets/report.csv` includes:
-- **Success**: Downloaded PDFs with filenames
-- **No Datasheet**: Parts found but no datasheet available
-- **Not Found**: Parts not in DigiKey database
-- **Download Failed**: Parts found but download blocked (includes manual URLs)
-- **Errors**: API or network issues
+| Problem | Solution |
+|---------|----------|
+| **Many 403 errors** | Script auto-handles this, but reduce `MAX_WORKERS` to 5-8 |
+| **Rate limit errors** | Reduce `REQUESTS_PER_MINUTE` to 60-80 |
+| **Slow downloads** | Increase `MAX_WORKERS` to 10-15 |
+| **Interrupted run** | Just restart - auto-resumes from where it stopped |
 
 ## ⚠️ Important Notes
 
-- **API Keys**: Never commit `api_keys.json` (it's in `.gitignore`)
-- **Rate Limits**: Start conservative, increase if no issues
-- **Large Lists**: Script handles 200+ parts automatically with resume capability
+- **Rate Limits**: Start conservative, the script auto-detects and handles limits
+- **Large Lists**: Handles 500+ parts efficiently with resume capability
+- **CSV Format**: Standard 3-column format: Internal P/N, Manufacturer, Manufacturer P/N
 - **Legal**: Ensure compliance with DigiKey's Terms of Service
+
+---
+
+**Ready to download? Just run `python3 script_new.py parts.csv` and watch it work!**

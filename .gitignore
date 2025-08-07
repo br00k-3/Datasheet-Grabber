@@ -1,12 +1,14 @@
 # Downloaded files
 datasheets/
-parts_list.csv
+parts.csv
+
+# Log files
+reports/
 
 # API Keys - NEVER commit these!
 api_keys.json
 
-# Process lock file
-script.lock
+
 
 # Python cache files
 __pycache__/
