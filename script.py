@@ -1,11 +1,10 @@
-import requests, os, json, time, random, threading, sys, csv, queue, logging, urllib3 
+import requests, os, json, time, random, threading, sys, csv, queue, logging, urllib3
 from rich.console import Console, Group
 from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn, SpinnerColumn
 from rich.table import Table
 from rich.live import Live
 from datetime import datetime, timedelta
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 
 # CONFIGURATION
 MAX_WORKERS = 5
@@ -15,7 +14,6 @@ MAX_ATTEMPTS = 3
 LOGGING = True  # Enable logging to file
 CRAWL_DELAY_DEFAULT = 0
 
- 
 class RateLimitExceeded(Exception):
     pass
 
@@ -47,6 +45,7 @@ if LOGGING:  # Only add file handler if logging to file is enabled
     handlers.append(file_handler)
 
 logging.basicConfig(level=logging.INFO, handlers=handlers)
+
 logger = logging.getLogger(__name__)
 
 def load_api_keys():
@@ -239,7 +238,7 @@ class APIWorker:
                 internal_pn, manufacturer_pn, manufacturer_name = part_info
 
                 if self.progress:
-                    self.progress.update_worker_status(self.worker_id, "🔍", f"{internal_pn}")
+                    self.progress.update_worker_status(self.worker_id, "🔍 Searching", f"{internal_pn}")
 
                 # Check if file already exists
                 # Use standard encoding for filename matching
@@ -481,7 +480,7 @@ class DownloadWorker:
                         url_display = url_display[:57] + '...'
                     self.progress.update_worker_status(
                         self.worker_id,
-                        "📥",
+                        "📥 Downloading",
                         f"{job.internal_pn} | {url_display}"
                     )
                 # Create filepath
@@ -529,90 +528,6 @@ class DownloadWorker:
             self.progress.update_worker_status(self.worker_id, "⚪ Idle", "")
 
 
-
-class ProgressDisplay:
-    def __init__(self, total_parts):
-        self.total_parts = total_parts
-        self.completed = 0
-        self.workers = {}
-        self.results = {
-            "success": 0,
-            "not_found": 0,
-            "no_datasheet": 0,
-            "download_failed": 0,
-            "error": 0,
-            "skipped": 0
-        }
-        self.start_time = time.time()
-        self.lock = threading.Lock()
-        self.console = Console()
-        self._progress = Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("{task.completed}/{task.total}"),
-            TextColumn("[{task.percentage:>3.0f}%]"),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-            console=self.console,
-            transient=False,
-            auto_refresh=False  # We'll refresh via Live
-        )
-        self._task_id = self._progress.add_task("Downloading", total=total_parts)
-        self._live = None
-        self._started = False
-
-    def _render_group(self):
-        # Results summary table
-        table = Table(title="Results Summary", show_header=True, header_style="bold magenta")
-        table.add_column("Status")
-        table.add_column("Count", justify="right")
-        table.add_row("✅ Downloaded", str(self.results['success']), style="green")
-        table.add_row("⏭️  Skipped", str(self.results['skipped']), style="cyan")
-        table.add_row("⚠️  No datasheet", str(self.results['no_datasheet']), style="yellow")
-        table.add_row("❌ Not found", str(self.results['not_found']), style="red")
-        table.add_row("⚠️  Download failed", str(self.results['download_failed']), style="yellow")
-        table.add_row("❌ Errors", str(self.results['error']), style="red")
-        # Worker status table
-        worker_table = Table(title="Workers", show_header=True, header_style="bold cyan")
-        worker_table.add_column("Worker ID")
-        worker_table.add_column("Status")
-        for worker_id, status in self.workers.items():
-            worker_table.add_row(worker_id, status)
-        return Group(self._progress, table, worker_table)
-
-    def update_worker_status(self, worker_id, status, part_info):
-        with self.lock:
-            self.workers[worker_id] = f"{status} {part_info}".strip()
-
-    def update_progress(self, result):
-        with self.lock:
-            self.completed += 1
-            self._progress.update(self._task_id, completed=self.completed)
-            # Count result types
-            status = result.get("status", "unknown")
-            if result.get("skipped"):
-                self.results["skipped"] += 1
-            elif status in self.results:
-                self.results[status] += 1
-            else:
-                self.results["error"] += 1
-
-    def display(self):
-        with self.lock:
-            if not self._started:
-                self._live = Live(self._render_group(), console=self.console, refresh_per_second=4, transient=False)
-                self._live.__enter__()
-                self._started = True
-            else:
-                self._live.update(self._render_group())
-
-    def final_summary(self):
-        elapsed = time.time() - self.start_time
-        total = self.results['success'] + self.results['skipped']
-        self._live.__exit__(None, None, None)  # End live context
-        self.console.print(f"[bold green]Total Downloaded:[/bold green] {total}")
-        self.console.print(f"[bold yellow]⏱️  Total time:[/bold yellow] {int(elapsed//60)}:{int(elapsed%60):02d}")
 
 def load_parts_from_csv(filename):
     """Load parts from CSV file"""
@@ -742,7 +657,6 @@ def main():
         parts_queue.put(part)
 
     # Setup progress display
-    progress = ProgressDisplay(len(parts))
 
     # Setup workers
     api_workers = []
@@ -754,7 +668,6 @@ def main():
             downloader=None,
             download_queue=download_queue,
             results_queue=results_queue,
-            progress=progress,
             api_key=API_KEYS[i % len(API_KEYS)],
             worker_id=f"API-Worker-{i+1}"
         )
@@ -766,7 +679,6 @@ def main():
         worker = DownloadWorker(
             download_queue=download_queue,
             results_queue=results_queue,
-            progress=progress,
             worker_id=f"DL-Worker-{i+1}"
         )
         download_workers.append(worker)
@@ -792,13 +704,10 @@ def main():
                 result = results_queue.get(timeout=1)
                 results.append(result)
                 completed += 1
-                progress.update_progress(result)
-                progress.display()
                 last_display = now
             except queue.Empty:
                 # Update display at least once per second
                 if now - last_display >= 1.0:
-                    progress.display()
                     last_display = now
                 continue
             except KeyboardInterrupt:
@@ -822,9 +731,258 @@ def main():
     except KeyboardInterrupt:
         print("\nShutdown interrupted. Exiting immediately.")
         return
-    progress.final_summary()
     save_results_to_csv(results)
     logger.info("✅ Complete!")
+
+import requests, os, json, time, random, threading, sys, csv, queue, logging, urllib3 
+from rich.console import Console, Group
+from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn, SpinnerColumn
+from rich.table import Table
+from rich.live import Live
+from datetime import datetime, timedelta
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+MAX_WORKERS = 5
+MAX_API_WORKERS = 1
+REQUESTS_PER_MINUTE = 120
+MAX_ATTEMPTS = 3
+LOGGING = True  # Enable logging to file
+
+API_KEYS = load_api_keys()
+
+def run_downloader(csv_file, status_callback=None, progress_callback=None, config=None, results_callback=None, worker_callback=None, should_stop=None):
+    global MAX_WORKERS, MAX_API_WORKERS, REQUESTS_PER_MINUTE, MAX_ATTEMPTS, LOGGING
+    """
+    Run the datasheet downloader, calling status_callback(msg) and progress_callback(completed, total) as appropriate.
+    Accepts config dict for settings, results_callback for table updates, worker_callback for worker status updates.
+    """
+    # Use config values if provided, else fallback to defaults
+    cfg = config or {}
+    max_workers = cfg.get("MAX_WORKERS", 5)
+    max_api_workers = cfg.get("MAX_API_WORKERS", 1)
+    requests_per_minute = cfg.get("REQUESTS_PER_MINUTE", 120)
+    max_attempts = cfg.get("MAX_ATTEMPTS", 3)
+    logging_enabled = cfg.get("LOGGING", True)
+    # Optionally set globals if needed (for legacy code)
+    MAX_WORKERS = max_workers
+    MAX_API_WORKERS = max_api_workers
+    REQUESTS_PER_MINUTE = requests_per_minute
+    MAX_ATTEMPTS = max_attempts
+    LOGGING = logging_enabled
+
+    # Setup logging handlers only when download starts
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+    handlers = []
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setLevel(logging.INFO)
+    stream_handler.addFilter(MaxLevelFilter(logging.WARNING))
+    stream_handler.setFormatter(logging.Formatter('%(message)s'))
+    handlers.append(stream_handler)
+    if logging_enabled:  # Only add file handler if logging to file is enabled
+        os.makedirs('reports', exist_ok=True)
+        now = datetime.now()
+        timestamp = now.strftime('%Y-%m-%d %H-%M-%S')
+        log_filename = f'reports/{timestamp}_report.log'
+        file_handler = logging.FileHandler(log_filename, mode='w', encoding='utf-8')
+        file_handler.setLevel(logging.WARNING)
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        handlers.append(file_handler)
+    logging.basicConfig(level=logging.INFO, handlers=handlers)
+
+    API_KEYS = load_api_keys()
+    if not API_KEYS:
+        if status_callback:
+            status_callback("❌ No API keys found! Please configure api_keys.json\n")
+        return
+    parts = load_parts_from_csv(csv_file)
+    if not parts:
+        if status_callback:
+            status_callback(f"❌ No parts to process in {csv_file}!\n")
+        return
+    parts_queue = queue.Queue()
+    download_queue = queue.Queue()
+    results_queue = queue.Queue()
+    for part in parts:
+        parts_queue.put(part)
+
+def run_downloader(csv_file, status_callback=None, progress_callback=None, config=None, results_callback=None, worker_callback=None, should_stop=None):
+    global MAX_WORKERS, MAX_API_WORKERS, REQUESTS_PER_MINUTE, MAX_ATTEMPTS, LOGGING
+    """
+    Run the datasheet downloader, calling status_callback(msg) and progress_callback(completed, total) as appropriate.
+    Accepts config dict for settings, results_callback for table updates, worker_callback for worker status updates.
+    should_stop: optional callable to signal early termination (for GUI thread interruption)
+    """
+    # Use config values if provided, else fallback to defaults
+    cfg = config or {}
+    max_workers = cfg.get("MAX_WORKERS", 5)
+    max_api_workers = cfg.get("MAX_API_WORKERS", 1)
+    requests_per_minute = cfg.get("REQUESTS_PER_MINUTE", 120)
+    max_attempts = cfg.get("MAX_ATTEMPTS", 3)
+    logging_enabled = cfg.get("LOGGING", True)
+    # Optionally set globals if needed (for legacy code)
+    MAX_WORKERS = max_workers
+    MAX_API_WORKERS = max_api_workers
+    REQUESTS_PER_MINUTE = requests_per_minute
+    MAX_ATTEMPTS = max_attempts
+    LOGGING = logging_enabled
+
+    # Setup logging handlers only when download starts
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+    handlers = []
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setLevel(logging.INFO)
+    stream_handler.addFilter(MaxLevelFilter(logging.WARNING))
+    stream_handler.setFormatter(logging.Formatter('%(message)s'))
+    handlers.append(stream_handler)
+    if logging_enabled:  # Only add file handler if logging to file is enabled
+        os.makedirs('reports', exist_ok=True)
+        now = datetime.now()
+        timestamp = now.strftime('%Y-%m-%d %H-%M-%S')
+        log_filename = f'reports/{timestamp}_report.log'
+        file_handler = logging.FileHandler(log_filename, mode='w', encoding='utf-8')
+        file_handler.setLevel(logging.WARNING)
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        handlers.append(file_handler)
+    logging.basicConfig(level=logging.INFO, handlers=handlers)
+
+    API_KEYS = load_api_keys()
+    if not API_KEYS:
+        if status_callback:
+            status_callback("❌ No API keys found! Please configure api_keys.json\n")
+        return
+    parts = load_parts_from_csv(csv_file)
+    if not parts:
+        if status_callback:
+            status_callback(f"❌ No parts to process in {csv_file}!\n")
+        return
+    parts_queue = queue.Queue()
+    download_queue = queue.Queue()
+    results_queue = queue.Queue()
+    for part in parts:
+        parts_queue.put(part)
+    completed = 0
+    total = len(parts)
+    # Progress object to track worker status
+    class ProgressTracker:
+        def __init__(self, worker_count, api_worker_count):
+            self.worker_status = {i: "Idle" for i in range(worker_count)}
+            self.api_worker_status = {i: "Idle" for i in range(api_worker_count)}
+        def update_worker_status(self, worker_id, status, details):
+            # worker_id is like "DL-Worker-1" or "API-Worker-1"
+            print(f"DEBUG: update_worker_status called: {worker_id}, {status}, {details}")
+            if worker_id.startswith("DL-Worker-"):
+                idx = int(worker_id.split("-")[-1]) - 1
+                self.worker_status[idx] = status if details == "" else f"{status} {details}"
+            elif worker_id.startswith("API-Worker-"):
+                idx = int(worker_id.split("-")[-1]) - 1
+                self.api_worker_status[idx] = status if details == "" else f"{status} {details}"
+        def get_all_status(self):
+            # Merge both dicts, API workers first, then DL workers
+            merged = {}
+            offset = 0
+            for i in range(len(self.api_worker_status)):
+                merged[offset + i] = self.api_worker_status[i]
+            offset += len(self.api_worker_status)
+            for i in range(len(self.worker_status)):
+                merged[offset + i] = self.worker_status[i]
+            print("[DEBUG] ProgressTracker.get_all_status returns:", merged)
+            return dict(merged)
+
+    progress_tracker = ProgressTracker(max_workers, max_api_workers)
+    api_workers = []
+    download_workers = []
+    for i in range(max_api_workers):
+        worker = APIWorker(
+            downloader=None,
+            download_queue=download_queue,
+            results_queue=results_queue,
+            progress=progress_tracker,
+            api_key=API_KEYS[i % len(API_KEYS)],
+            worker_id=f"API-Worker-{i+1}"
+        )
+        worker.set_parts_queue(parts_queue)
+        api_workers.append(worker)
+    for i in range(max_workers):
+        worker = DownloadWorker(
+            download_queue=download_queue,
+            results_queue=results_queue,
+            progress=progress_tracker,
+            worker_id=f"DL-Worker-{i+1}"
+        )
+        download_workers.append(worker)
+    for worker in api_workers:
+        worker.start()
+    for worker in download_workers:
+        worker.start()
+    if status_callback:
+        status_callback(f"🚀 Starting datasheet downloader...\n")
+        status_callback(f"⚙️  Settings: {max_api_workers} API workers + {max_workers} download workers\n")
+    results = []
+    # For table/worker updates
+    result_counts = {0:0, 1:0, 2:0, 3:0, 4:0, 5:0}  # Downloaded, Skipped, No datasheet, Not found, Download failed, Errors
+    worker_status = {}
+    try:
+        last_worker_update = time.time()
+        while completed < total:
+            now = time.time()
+            try:
+                if should_stop is not None and callable(should_stop) and should_stop():
+                    raise KeyboardInterrupt
+                result = results_queue.get(timeout=0.2)
+                results.append(result)
+                completed += 1
+                # Update result_counts for table
+                status = result.get('status', '')
+                if result.get('skipped') or status == 'success':
+                    result_counts[0] += 1
+                elif status == 'not_found':
+                    result_counts[3] += 1
+                elif status == 'no_datasheet':
+                    result_counts[2] += 1
+                elif status == 'download_failed':
+                    result_counts[4] += 1
+                elif status == 'error':
+                    result_counts[5] += 1
+                else:
+                    result_counts[1] += 1  # Skipped/other
+                if results_callback:
+                    results_callback(result_counts.copy())
+                if progress_callback:
+                    progress_callback(completed, total)
+                if worker_callback:
+                    debug_status = progress_tracker.get_all_status()
+                    print("[DEBUG] Sending worker status to GUI:", debug_status)
+                    worker_callback(debug_status)
+                if status_callback:
+                    status_callback(f"Downloaded: {completed}/{total} | Status: {result.get('status', 'unknown')}\n")
+            except queue.Empty:
+                # Periodically send worker status updates even if no result
+                if worker_callback and (now - last_worker_update > 0.5):
+                    worker_callback(progress_tracker.get_all_status())
+                    last_worker_update = now
+    except RateLimitExceeded:
+        if status_callback:
+            status_callback("❌ Shutting down due to rate limit exceeded.\n")
+        for worker in api_workers:
+            worker.is_running = False
+        for worker in download_workers:
+            worker.is_running = False
+        return
+    except KeyboardInterrupt:
+        if status_callback:
+            status_callback("⏹️  Shutdown requested...\n")
+        for worker in api_workers:
+            worker.is_running = False
+        for worker in download_workers:
+            worker.is_running = False
+    except Exception as e:
+        if status_callback:
+            status_callback(f"❌ Error: {e}\n")
+    if status_callback:
+        status_callback("✅ Complete!\n")
+    save_results_to_csv(results)
 
 if __name__ == "__main__":
     main()
