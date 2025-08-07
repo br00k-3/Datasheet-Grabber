@@ -1,10 +1,10 @@
-import requests, os, json, time, random, threading, sys, csv, queue, logging
+import requests, os, json, time, random, threading, sys, csv, queue, logging, urllib3 
 from rich.console import Console, Group
 from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn, SpinnerColumn
 from rich.table import Table
 from rich.live import Live
 from datetime import datetime, timedelta
-
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 # CONFIGURATION
@@ -559,8 +559,8 @@ class ProgressDisplay:
             auto_refresh=False  # We'll refresh via Live
         )
         self._task_id = self._progress.add_task("Downloading", total=total_parts)
-        self._live = Live(self._render_group(), console=self.console, refresh_per_second=4, transient=False)
-        self._live.__enter__()  # Start live context
+        self._live = None
+        self._started = False
 
     def _render_group(self):
         # Results summary table
@@ -600,8 +600,12 @@ class ProgressDisplay:
 
     def display(self):
         with self.lock:
-            # Only update the live display in-place (no extra progress context)
-            self._live.update(self._render_group())
+            if not self._started:
+                self._live = Live(self._render_group(), console=self.console, refresh_per_second=4, transient=False)
+                self._live.__enter__()
+                self._started = True
+            else:
+                self._live.update(self._render_group())
 
     def final_summary(self):
         elapsed = time.time() - self.start_time

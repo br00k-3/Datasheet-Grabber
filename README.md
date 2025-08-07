@@ -1,4 +1,3 @@
-
 # Datasheet Grabber
 
 A robust, multi-threaded Python tool for automatically searching, downloading, and reporting datasheets for electronic parts. Designed for reliability, anti-bot evasion, and user-friendly progress display.
@@ -12,6 +11,41 @@ A robust, multi-threaded Python tool for automatically searching, downloading, a
 - **Graceful shutdown**: Handles rate limits and user interrupts cleanly.
 - **Rich progress display**: Beautiful, live-updating terminal UI with per-worker status.
 - **Detailed CSV report**: Results are saved and sorted for easy review.
+
+## Example
+```
+$ py script.py parts.csv
+Loaded 329 parts from parts.csv
+🚀 Starting datasheet downloader...
+⚙️  Settings: 1 API workers + 5 download workers
+  Downloading ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 329/329 [100%] 0:01:28 0:00:00
+     Results Summary        
+┏━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━┓
+┃ Status               ┃ Count ┃
+┡━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━┩
+│ ✅ Downloaded        │     0 │
+│ ⏭️ Skipped           │   174 │
+│ ⚠️ No datasheet      │     3 │
+│ ❌ Not found         │   116 │
+│ ⚠️ Download failed   │    36 │
+│ ❌ Errors            │     0 │
+└──────────────────────┴───────┘
+                                      Workers                                 
+┏━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ Worker ID    ┃ Status                                                                     ┃
+┡━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ API-Worker-1 │ 🔍 R001                                                                    │
+│ DL-Worker-3  │ 📥 R001 | https://www.example.com/datasheets/R001                          │
+│ DL-Worker-2  │ 📥 R002 | https://www.example.com/datasheets/R002                          │
+│ DL-Worker-4  │ 📥 R003 | https://www.example.com/datasheets/R003                          │
+│ DL-Worker-1  │ 📥 R004 | https://www.example.com/datasheets/R004                          │
+│ DL-Worker-5  │ 📥 R005 | https://www.example.com/datasheets/R005                          │
+└──────────────┴────────────────────────────────────────────────────────────────────────────┘
+Total Downloaded: 174
+⏱️  Total time: 1:31
+📄 Report saved: reports/2025-08-07 14-06-55_report.csv
+✅ Complete!
+```
 
 ## Requirements
 
