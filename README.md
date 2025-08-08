@@ -13,66 +13,13 @@ A robust, multi-threaded Python tool for automatically searching, downloading, a
 - **Detailed CSV report**: Results are saved and sorted for easy review.
 
 ## Example
-```
-$ py script.py parts.csv
-Loaded 329 parts from parts.csv
-🚀 Starting datasheet downloader...
-⚙️  Settings: 1 API workers + 5 download workers
-  Downloading ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 329/329 [100%] 0:01:28 0:00:00
-     Results Summary        
-┏━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━┓
-┃ Status               ┃ Count ┃
-┡━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━┩
-│ ✅ Downloaded        │     0 │
-│ ⏭️ Skipped           │   174 │
-│ ⚠️ No datasheet      │     3 │
-│ ❌ Not found         │   116 │
-│ ⚠️ Download failed   │    36 │
-│ ❌ Errors            │     0 │
-└──────────────────────┴───────┘
-                                      Workers                                 
-┏━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-┃ Worker ID    ┃ Status                                                                     ┃
-┡━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
-│ API-Worker-1 │ 🔍 R001                                                                    │
-│ DL-Worker-3  │ 📥 R001 | https://www.example.com/datasheets/R001                          │
-│ DL-Worker-2  │ 📥 R002 | https://www.example.com/datasheets/R002                          │
-│ DL-Worker-4  │ 📥 R003 | https://www.example.com/datasheets/R003                          │
-│ DL-Worker-1  │ 📥 R004 | https://www.example.com/datasheets/R004                          │
-│ DL-Worker-5  │ 📥 R005 | https://www.example.com/datasheets/R005                          │
-└──────────────┴────────────────────────────────────────────────────────────────────────────┘
-Total Downloaded: 174
-⏱️  Total time: 1:31
-📄 Report saved: reports/2025-08-07 14-06-55_report.csv
-✅ Complete!
-```
-
-## Requirements
-
-- Python 3.8+
-- `requests`
-- `rich`
-
-Install dependencies:
-
-```
-pip install -r requirements.txt
-```
+<img width="702" height="532" alt="Screenshot 2025-08-07 164155" src="https://github.com/user-attachments/assets/fe64a795-ef64-48cf-a9b4-3d80677f1a78" />
 
 ## Setup
 
-1. **API Keys**: Create an `api_keys.json` file in the project root:
+1. **API Keys**: Press the key icon in the top right and enter your API key and secret
 
-```json
-{
-  "api_keys": [
-    {
-      "CLIENT_ID": "your_digikey_client_id",
-      "CLIENT_SECRET": "your_digikey_client_secret"
-    }
-  ]
-}
-```
+
 
 2. **Parts List**: Prepare a CSV file (e.g., `parts.csv`) with columns:
 
@@ -84,26 +31,21 @@ Internal P/N,Manufacturer,Manufacturer P/N
 
 ## Usage
 
-Run the script with your parts file:
+Press Start Download! (It's that easy)
 
-```
-python script.py parts.csv
-```
-
-- Progress and worker status will be shown in the terminal.
 - Results are saved to `datasheets/report.csv`.
 - Downloaded PDFs are saved in the `datasheets/` folder.
 - Errors and warnings are logged to `report.log`.
 
 ## Customization
 
-- **Crawl Delays**: Edit `CRAWL_DELAY_PER_DOMAIN` and `CRAWL_DELAY_DEFAULT` in `script.py`.
-- **Worker Counts**: Adjust `MAX_WORKERS` and `MAX_API_WORKERS` in `script.py`.
-
+- **Worker Counts**: Adjust `MAX_WORKERS` and `MAX_API_WORKERS` in settings
+- **Rate Limit**: Adjust the number of calls made per minute
+- **Max Retries**: Adjust how many times the program will retry a download on fail
+  
 ## Troubleshooting
 
 - If you see 403/429 errors, check your API keys and try increasing crawl delays.
-- If the display is glitchy, try resizing your terminal or using a different terminal emulator.
 - For debugging, check `report.log` for detailed error messages.
 
 ## License
@@ -114,8 +56,6 @@ MIT License. See `LICENSE` file for details.
 *Created by br00k-3. Contributions welcome!*
 
 ## 📋 Report Format
-
-The `datasheets/report.csv` is organized by status priority:
 
 | Status | Description | Action Required |
 |--------|-------------|-----------------|
@@ -140,7 +80,3 @@ The `datasheets/report.csv` is organized by status priority:
 - **Large Lists**: Handles 500+ parts efficiently with resume capability
 - **CSV Format**: Standard 3-column format: Internal P/N, Manufacturer, Manufacturer P/N
 - **Legal**: Ensure compliance with DigiKey's Terms of Service
-
----
-
-**Ready to download? Just run `python3 script_new.py parts.csv` and watch it work!**
