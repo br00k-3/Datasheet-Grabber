@@ -1,0 +1,7 @@
+{
+  "MAX_WORKERS": 5,
+  "MAX_API_WORKERS": 1,
+  "REQUESTS_PER_MINUTE": 120,
+  "MAX_ATTEMPTS": 3,
+  "LOGGING": true
+}
