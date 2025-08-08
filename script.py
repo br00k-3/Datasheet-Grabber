@@ -1,200 +1,23 @@
-import requests, os, json, time, random, threading, sys, csv, queue, logging, urllib3
-from rich.console import Console, Group
-from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn, SpinnerColumn
-from rich.table import Table
-from rich.live import Live
+import requests
+import os
+import json
+import threading
+import logging
 from datetime import datetime, timedelta
+import time
+import random
+import queue
+import csv
+import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# CONFIGURATION
-MAX_WORKERS = 5
-MAX_API_WORKERS = 1
-REQUESTS_PER_MINUTE = 120
+# Ensure logger is defined
+logger = logging.getLogger(__name__)
+
 MAX_ATTEMPTS = 3
-LOGGING = True  # Enable logging to file
-CRAWL_DELAY_DEFAULT = 0
 
 class RateLimitExceeded(Exception):
     pass
-
-class MaxLevelFilter(logging.Filter):
-    def __init__(self, level):
-        self.level = level
-    def filter(self, record):
-        return record.levelno < self.level
-
-for handler in logging.root.handlers[:]:
-    logging.root.removeHandler(handler)
-
-handlers = []
-
-stream_handler = logging.StreamHandler(sys.stdout)
-stream_handler.setLevel(logging.INFO)
-stream_handler.addFilter(MaxLevelFilter(logging.WARNING))  # Only show INFO and below in terminal
-stream_handler.setFormatter(logging.Formatter('%(message)s'))
-handlers.append(stream_handler)
-
-if LOGGING:  # Only add file handler if logging to file is enabled
-    os.makedirs('reports', exist_ok=True)
-    now = datetime.now()
-    timestamp = now.strftime('%Y-%m-%d %H-%M-%S')
-    log_filename = f'reports/{timestamp}_report.log'
-    file_handler = logging.FileHandler(log_filename, mode='w', encoding='utf-8')
-    file_handler.setLevel(logging.WARNING)
-    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-    handlers.append(file_handler)
-
-logging.basicConfig(level=logging.INFO, handlers=handlers)
-
-logger = logging.getLogger(__name__)
-
-def load_api_keys():
-    """Load API keys from external file"""
-    try:
-        with open('api_keys.json', 'r') as f:
-            config = json.load(f)
-            return config.get('api_keys', [])
-    except FileNotFoundError:
-        logger.error("❌ api_keys.json not found!")
-        return []
-    except Exception as e:
-        logger.error(f"❌ Error loading API keys: {e}")
-        return []
-
-API_KEYS = load_api_keys()
-
-def download_pdf_with_requests(url, filepath, internal_pn=None):
-    # URL is already rewritten in DownloadJob
-    # If the URL does not end with .pdf, wait a few seconds before attempting to download
-    if not url.lower().endswith('.pdf'):
-        logger.warning(f"URL does not end with .pdf, waiting 5 seconds before downloading: {url}")
-        time.sleep(5)
-    """Download PDF with 403 error handling - matching main branch approach"""
-    
-    # More realistic, browser-like headers for 403 avoidance
-    user_agents = [
-        # Windows desktop browsers
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.112 Safari/537.36',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.112 Safari/537.36 Edg/125.0.2535.67',
-        # Mac desktop browsers
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5_2) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
-        # Mobile browsers
-        'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-        'Mozilla/5.0 (Linux; Android 14; Pixel 7 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.112 Mobile Safari/537.36',
-    ]
-
-    # Modern browser headers (randomize User-Agent and some Sec-CH-UA values)
-    user_agent = random.choice(user_agents)
-    sec_ch_ua = '"Chromium";v="125", "Not.A/Brand";v="8", "Google Chrome";v="125"' if 'Chrome' in user_agent else '"Not.A/Brand";v="8", "Chromium";v="125"'
-    sec_ch_ua_mobile = '?1' if 'Mobile' in user_agent or 'iPhone' in user_agent or 'Android' in user_agent else '?0'
-    sec_ch_ua_platform = '"Windows"' if 'Windows' in user_agent else ('"macOS"' if 'Macintosh' in user_agent else ('"Android"' if 'Android' in user_agent else '"iOS"'))
-
-    headers = {
-        'User-Agent': user_agent,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-        'Referer': url,  # Some sites require a referer
-        'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache',
-        'DNT': '1',
-        'Upgrade-Insecure-Requests': '1',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Sec-Fetch-User': '?1',
-        'Sec-CH-UA': sec_ch_ua,
-        'Sec-CH-UA-Mobile': sec_ch_ua_mobile,
-        'Sec-CH-UA-Platform': sec_ch_ua_platform,
-    }
-
-
-    session = requests.Session()
-    session.headers.update(headers)
-    for attempt in range(MAX_ATTEMPTS):
-        response = None
-        try:
-            # Try with SSL verification
-            response = session.get(url, timeout=30, allow_redirects=True, stream=True, verify=True)
-        except requests.exceptions.SSLError as ssl_err:
-            logger.warning(f"[{internal_pn}] SSL error for {url} (Attempt {attempt+1}/{MAX_ATTEMPTS}): {ssl_err}. Retrying without certificate verification.")
-            try:
-                response = session.get(url, timeout=30, allow_redirects=True, stream=True, verify=False)
-            except Exception as e:
-                logger.warning(f"[{internal_pn}] Failed to download {url} without SSL verification: {e}")
-                if attempt < MAX_ATTEMPTS - 1:
-                    continue
-                return False, f"SSL error: {ssl_err} | Fallback failed: {e}"
-        except Exception as e:
-            logger.warning(f"[{internal_pn}] Unexpected error for {url}: {e}")
-            if attempt < MAX_ATTEMPTS - 1:
-                continue
-            return False, f"Download error: {str(e)}"
-
-        if response is None:
-            continue
-
-        # Handle 403 errors
-        if response.status_code == 403:
-            if attempt < MAX_ATTEMPTS - 1:
-                logger.warning(f"[{internal_pn}] 403 Forbidden for URL: {url} (Attempt {attempt+1}/{MAX_ATTEMPTS}) | Retrying after crawl delay.")
-                continue
-            return False, "HTTP 403 Forbidden - Access denied after retries"
-        # Handle rate limiting
-        elif response.status_code == 429:
-            if attempt < MAX_ATTEMPTS - 1:
-                logger.warning(f"[{internal_pn}] 429 Rate Limited for URL: {url} (Attempt {attempt+1}/{MAX_ATTEMPTS}) | Retrying after crawl delay.")
-                continue
-            logger.error(f"[{internal_pn}] 429 Rate Limited for URL: {url} (Final attempt). Raising RateLimitExceeded.")
-            raise RateLimitExceeded()
-        elif response.status_code == 200:
-            # Download the content
-            content = b''
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    content += chunk
-            # Verify it's a PDF and has reasonable size
-            if len(content) > 1000 and content.startswith(b'%PDF'):
-                with open(filepath, 'wb') as f:
-                    f.write(content)
-                return True, "Downloaded successfully"
-            elif len(content) <= 1000:
-                logger.warning(f"[{internal_pn}] Downloaded file too small for {url} (size: {len(content)} bytes)")
-                return False, "PDF content too small"
-            elif not content.startswith(b'%PDF'):
-                logger.warning(f"[{internal_pn}] Downloaded file is not a valid PDF for {url}")
-                return False, "Response not a valid PDF"
-            else:
-                logger.warning(f"[{internal_pn}] Unknown content issue for {url}")
-                return False, "Unknown content issue"
-        else:
-            return False, f"HTTP {response.status_code}"
-    return False, "Failed after all retry attempts"
-
-class DownloadJob:
-    
-    def __init__(self, internal_pn, manufacturer_pn, manufacturer_name, datasheet_url, 
-                 found_part, manufacturer_found, digikey_pn):
-        self.internal_pn = internal_pn
-        self.manufacturer_pn = manufacturer_pn
-        self.manufacturer_name = manufacturer_name
-        # Rewrite datasheet_url as early as possible
-        url = datasheet_url
-        if url:
-            if url.startswith('//'):
-                url = 'https:' + url
-            url = url.replace('onsemi.com', 'onsemi.cn')
-            url = url.replace(' ', '%20')
-        self.datasheet_url = url
-        self.found_part = found_part
-        self.manufacturer_found = manufacturer_found
-        self.digikey_pn = digikey_pn
-        # Sanitize filename: replace / with %2F and \ with %5C (standard URL encoding)
-        safe_internal_pn = str(internal_pn).replace('/', '%2F').replace('\\', '%5C')
-        safe_manufacturer_pn = str(manufacturer_pn).replace('/', '%2F').replace('\\', '%5C')
-        self.filename = f"{safe_internal_pn} {safe_manufacturer_pn}.pdf"
 
 class APIWorker:
     def __init__(self, downloader, download_queue, results_queue, progress, api_key, worker_id="API-Worker"):
@@ -209,172 +32,123 @@ class APIWorker:
         self.parts_queue = None
         self.access_token = None
         self.token_expiry = None
-    
+
     def start(self):
         if not self.is_running:
             self.is_running = True
             self.thread = threading.Thread(target=self._run, daemon=True)
             self.thread.start()
-    
+
     def stop(self):
         self.is_running = False
         if self.thread:
             self.thread.join(timeout=5)
-    
+
     def set_parts_queue(self, parts_queue):
         self.parts_queue = parts_queue
-    
+
     def _run(self):
         while self.is_running:
             try:
-                try:
-                    part_info = self.parts_queue.get(timeout=1)
-                except queue.Empty:
+                if self.parts_queue is None:
+                    time.sleep(0.1)
                     continue
-
-                if part_info is None:
-                    break
-
-                internal_pn, manufacturer_pn, manufacturer_name = part_info
-
-                if self.progress:
-                    self.progress.update_worker_status(self.worker_id, "🔍 Searching", f"{internal_pn}")
-
-                # Check if file already exists
-                # Use standard encoding for filename matching
-                safe_internal_pn = str(internal_pn).replace('/', '%2F').replace('\\', '%5C')
-                safe_manufacturer_pn = str(manufacturer_pn).replace('/', '%2F').replace('\\', '%5C')
-                filename = f"{safe_internal_pn} {safe_manufacturer_pn}.pdf"
-                filepath = os.path.join("datasheets", filename)
-                if os.path.exists(filepath):
-                    try:
-                        with open(filepath, 'rb') as f:
-                            header = f.read(4)
-                            f.seek(0, 2)
-                            size = f.tell()
-                        if header == b'%PDF' and size > 1000:
-                            result = {
-                                'status': 'success',
-                                'internal_pn': internal_pn,
-                                'manufacturer_pn': manufacturer_pn,
-                                'found_part': manufacturer_pn,
-                                'manufacturer': 'Unknown',
-                                'filename': filename,
-                                'skipped': True
-                            }
-                            self.results_queue.put(result)
-                            self.parts_queue.task_done()
-                            continue
-                        else:
-                            # Not a valid PDF, delete and re-download
-                            os.remove(filepath)
-                    except Exception as e:
-                        logger.warning(f"Error checking PDF validity for {filepath}: {e}")
-                        try:
-                            os.remove(filepath)
-                        except Exception:
-                            pass
-
-                # Search for part
+                
                 try:
-                    product = self.search_part(manufacturer_pn)
-                except RateLimitExceeded:
-                    logger.error("❌ RATE LIMIT EXCEEDED in APIWorker. Stopping worker.")
-                    self.is_running = False
-                    break
-
-                if not product:
-                    result = {
-                        'status': 'not_found',
-                        'internal_pn': internal_pn,
-                        'manufacturer_pn': manufacturer_pn
-                    }
-                    self.results_queue.put(result)
-                elif product.get('error'):
-                    result = {
-                        'status': 'error',
-                        'internal_pn': internal_pn,
-                        'manufacturer_pn': manufacturer_pn,
-                        'error': product.get('message', 'Unknown error')
-                    }
-                    self.results_queue.put(result)
-                else:
-                    datasheet_url = product.get('DatasheetUrl')
-                    if not datasheet_url:
-                        result = {
-                            'status': 'no_datasheet',
+                    # Get part from queue with timeout
+                    part_data = self.parts_queue.get(timeout=1.0)
+                    internal_pn, manufacturer_pn, manufacturer = part_data
+                    
+                    if self.progress:
+                        self.progress.update_worker_status(self.worker_id, "🔍 Searching", manufacturer_pn)
+                    
+                    # Search for part
+                    result = self.search_part(manufacturer_pn)
+                    
+                    if result.get('error'):
+                        # API error - put result directly to results queue
+                        self.results_queue.put({
                             'internal_pn': internal_pn,
                             'manufacturer_pn': manufacturer_pn,
-                            'found_part': product.get('ManufacturerPartNumber', 'Unknown')
+                            'manufacturer': manufacturer,
+                            'status': 'error',
+                            'message': result.get('message', 'API error'),
+                            'datasheet_url': '',
+                            'file_path': ''
+                        })
+                    elif result.get('datasheet_url'):
+                        # Found datasheet - queue for download
+                        download_task = {
+                            'internal_pn': internal_pn,
+                            'manufacturer_pn': manufacturer_pn,
+                            'manufacturer': manufacturer,
+                            'datasheet_url': result['datasheet_url'],
+                            'product_info': result.get('product_info', {})
                         }
-                        self.results_queue.put(result)
+                        self.download_queue.put(download_task)
                     else:
-                        manufacturer_info = product.get('Manufacturer', {})
-                        manufacturer_found = manufacturer_info.get('Name', 'Unknown') if isinstance(manufacturer_info, dict) else 'Unknown'
-
-                        download_job = DownloadJob(
-                            internal_pn=internal_pn,
-                            manufacturer_pn=manufacturer_pn,
-                            manufacturer_name=manufacturer_name,
-                            datasheet_url=datasheet_url,
-                            found_part=product.get('ManufacturerPartNumber', manufacturer_pn),
-                            manufacturer_found=manufacturer_found,
-                            digikey_pn=product.get('DigiKeyPartNumber', '')
-                        )
-
-                        self.download_queue.put(download_job)
-
-                self.parts_queue.task_done()
-
+                        # No datasheet found
+                        self.results_queue.put({
+                            'internal_pn': internal_pn,
+                            'manufacturer_pn': manufacturer_pn,
+                            'manufacturer': manufacturer,
+                            'status': 'not_found',
+                            'message': 'Part not found in API',
+                            'datasheet_url': '',
+                            'file_path': ''
+                        })
+                    
+                    if self.progress:
+                        self.progress.update_worker_status(self.worker_id, "✅ Complete", "")
+                    
+                    self.parts_queue.task_done()
+                    
+                except queue.Empty:
+                    # No more parts to process
+                    if self.progress:
+                        self.progress.update_worker_status(self.worker_id, "⚪ Waiting", "")
+                    continue
+                    
             except RateLimitExceeded:
-                raise
+                if self.progress:
+                    self.progress.update_worker_status(self.worker_id, "⏱️ Rate limited", "")
+                time.sleep(60)  # Wait 1 minute
             except Exception as e:
-                logger.warning(f"API worker error: {e}")
-                if 'part_info' in locals():
-                    result = {
-                        'status': 'error',
-                        'internal_pn': part_info[0] if part_info else 'unknown',
-                        'manufacturer_pn': part_info[1] if part_info else 'unknown',
-                        'error': f'API worker error: {str(e)}'
-                    }
-                    self.results_queue.put(result)
-                    try:
-                        self.parts_queue.task_done()
-                    except:
-                        pass
+                logger.error(f"API Worker error: {e}")
+                if self.progress:
+                    self.progress.update_worker_status(self.worker_id, "❌ Error", str(e)[:20])
+                
         if self.progress:
             self.progress.update_worker_status(self.worker_id, "⚪ Idle", "")
-    
+
     def authenticate(self):
         data = {
             'client_id': self.api_key['CLIENT_ID'],
             'client_secret': self.api_key['CLIENT_SECRET'],
             'grant_type': 'client_credentials'
         }
-        
         try:
             response = requests.post("https://api.digikey.com/v1/oauth2/token", data=data, timeout=30)
             if response.status_code == 200:
                 token_data = response.json()
                 self.access_token = token_data['access_token']
-                expires_in = token_data.get('expires_in', 1800)
-                self.token_expiry = datetime.now() + timedelta(seconds=expires_in - 60)
+                expires_in = token_data.get('expires_in', 3600)
+                self.token_expiry = datetime.now() + timedelta(seconds=expires_in - 300)  # 5 min buffer
                 return True
             elif response.status_code == 429:
-                logger.error("❌ RATE LIMIT EXCEEDED!")
                 raise RateLimitExceeded()
             else:
-                logger.error(f"❌ Authentication failed: HTTP {response.status_code}")
+                logger.error(f"Auth failed: {response.status_code} {response.text}")
                 return False
         except Exception as e:
             logger.error(f"❌ Authentication error: {e}")
             return False
-    
+
     def _ensure_authenticated(self):
         if not self.access_token or datetime.now() >= self.token_expiry:
             return self.authenticate()
         return True
-    
+
     def search_part(self, part_number):
         if not self._ensure_authenticated():
             return {'error': 'authentication_failed', 'message': 'Failed to authenticate'}
@@ -386,7 +160,6 @@ class APIWorker:
             'Content-Type': 'application/json'
         }
         
-        # Use keyword search API for better results
         search_data = {
             "Keywords": part_number,
             "RecordCount": 10,
@@ -401,49 +174,46 @@ class APIWorker:
                 headers=headers,
                 timeout=30
             )
-            
             if response.status_code == 200:
-                result = response.json()
-                products = result.get('Products', [])
-                
+                data = response.json()
+                products = data.get('Products', [])
                 if products:
-                    # Find best match (simple version)
                     best_match = self._find_best_match(part_number, products)
-                    return best_match
-                else:
-                    return None
+                    if best_match and best_match.get('DatasheetUrl'):
+                        return {
+                            'datasheet_url': best_match['DatasheetUrl'],
+                            'product_info': best_match
+                        }
+                return {'datasheet_url': None}
             elif response.status_code == 404:
-                return None
+                return {'datasheet_url': None}
             elif response.status_code == 429:
-                logger.error("❌ RATE LIMIT EXCEEDED!")
                 raise RateLimitExceeded()
             else:
-                return {'error': 'api_error', 'message': f'API returned {response.status_code}'}
-                
+                return {'error': 'api_error', 'message': f'HTTP {response.status_code}'}
         except Exception as e:
             return {'error': 'request_failed', 'message': str(e)}
-    
+
     def _find_best_match(self, original_part, products):
-        """Find the best matching product from search results"""
-        # First, try exact match
+        # Exact match first
         for product in products:
             mpn = product.get('ManufacturerPartNumber', '')
             if mpn.upper() == original_part.upper():
                 return product
         
-        # Then try partial match
+        # Partial match
         for product in products:
             mpn = product.get('ManufacturerPartNumber', '')
             if original_part.upper() in mpn.upper() or mpn.upper() in original_part.upper():
                 return product
         
-        # Return first active product with datasheet
+        # Active products with datasheets
         for product in products:
             if product.get('ProductStatus') == 'Active' and product.get('DatasheetUrl'):
                 return product
         
-        # Fall back to first product
         return products[0] if products else None
+
 
 class DownloadWorker:
     def __init__(self, download_queue, results_queue, progress, worker_id):
@@ -453,433 +223,227 @@ class DownloadWorker:
         self.worker_id = worker_id
         self.is_running = False
         self.thread = None
-    
+
     def start(self):
         if not self.is_running:
             self.is_running = True
             self.thread = threading.Thread(target=self._run, daemon=True)
             self.thread.start()
-    
+
     def stop(self):
         self.is_running = False
         if self.thread:
             self.thread.join(timeout=5)
-    
+
     def _run(self):
         while self.is_running:
             try:
                 try:
-                    job = self.download_queue.get(timeout=1)
-                except queue.Empty:
-                    continue
-                if job is None:
-                    break
-                if self.progress:
-                    url_display = job.datasheet_url.replace('onsemi.com', 'onsemi.cn')
-                    if len(url_display) > 60:
-                        url_display = url_display[:57] + '...'
-                    self.progress.update_worker_status(
-                        self.worker_id,
-                        "📥 Downloading",
-                        f"{job.internal_pn} | {url_display}"
-                    )
-                # Create filepath
-                os.makedirs("datasheets", exist_ok=True)
-                filepath = os.path.join("datasheets", job.filename)
-                # Download with requests
-                success, message = download_pdf_with_requests(job.datasheet_url, filepath, job.internal_pn)
-                if success:
+                    # Get download task with timeout
+                    task = self.download_queue.get(timeout=1.0)
+                    
+                    internal_pn = task['internal_pn']
+                    manufacturer_pn = task['manufacturer_pn']
+                    manufacturer = task['manufacturer']
+                    datasheet_url = task['datasheet_url']
+                    
+                    if self.progress:
+                        self.progress.update_worker_status(self.worker_id, "⬇️ Downloading", manufacturer_pn)
+                    
+                    # Create filename
+                    safe_filename = "".join(c for c in manufacturer_pn if c.isalnum() or c in (' ', '-', '_')).rstrip()
+                    filepath = os.path.join("datasheets", f"{safe_filename}.pdf")
+                    
+                    # Create directory if needed
+                    os.makedirs("datasheets", exist_ok=True)
+                    
+                    # Download the file
+                    success, message = download_pdf_with_requests(datasheet_url, filepath, internal_pn)
+                    
+                    # Put result
                     result = {
-                        'status': 'success',
-                        'internal_pn': job.internal_pn,
-                        'manufacturer_pn': job.manufacturer_pn,
-                        'found_part': job.found_part,
-                        'manufacturer': job.manufacturer_found,
-                        'filename': job.filename,
-                        'url': job.datasheet_url
+                        'internal_pn': internal_pn,
+                        'manufacturer_pn': manufacturer_pn,
+                        'manufacturer': manufacturer,
+                        'status': 'success' if success else 'download_failed',
+                        'message': message,
+                        'datasheet_url': datasheet_url,
+                        'file_path': filepath if success else ''
                     }
-                else:
-                    result = {
-                        'status': 'download_failed',
-                        'internal_pn': job.internal_pn,
-                        'manufacturer_pn': job.manufacturer_pn,
-                        'found_part': job.found_part,
-                        'manufacturer': job.manufacturer_found,
-                        'url': job.datasheet_url,
-                        'error': message
-                    }
-                self.results_queue.put(result)
-                self.download_queue.task_done()
-            except Exception as e:
-                logger.warning(f"Download worker error: {e}")
-                if 'job' in locals():
-                    result = {
-                        'status': 'download_failed',
-                        'internal_pn': job.internal_pn if hasattr(job, 'internal_pn') else 'unknown',
-                        'manufacturer_pn': job.manufacturer_pn if hasattr(job, 'manufacturer_pn') else 'unknown',
-                        'error': f'Download worker error: {str(e)}'
-                    }
+                    
                     self.results_queue.put(result)
-                    try:
-                        self.download_queue.task_done()
-                    except:
-                        pass
+                    self.download_queue.task_done()
+                    
+                    if self.progress:
+                        status = "✅ Downloaded" if success else "❌ Failed"
+                        self.progress.update_worker_status(self.worker_id, status, "")
+                    
+                except queue.Empty:
+                    # No downloads to process
+                    if self.progress:
+                        self.progress.update_worker_status(self.worker_id, "⚪ Waiting", "")
+                    continue
+                    
+            except Exception as e:
+                logger.error(f"Download Worker error: {e}")
+                if self.progress:
+                    self.progress.update_worker_status(self.worker_id, "❌ Error", str(e)[:20])
+                
         if self.progress:
             self.progress.update_worker_status(self.worker_id, "⚪ Idle", "")
 
 
+# ... rest of the functions remain the same (MaxLevelFilter, load_api_keys, etc.)
 
-def load_parts_from_csv(filename):
-    """Load parts from CSV file"""
+class MaxLevelFilter(logging.Filter):
+    def __init__(self, level):
+        self.level = level
+
+    def filter(self, record):
+        return record.levelno < self.level
+
+
+def load_api_keys():
+    try:
+        with open('api_keys.json', 'r') as f:
+            config = json.load(f)
+            return config.get('api_keys', [])
+    except Exception:
+        return []
+
+
+def resolve_ti_redirect(url):
+    import urllib.parse
+    if url and url.startswith("https://www.ti.com/general/docs/suppproductinfo.tsp?"):
+        parsed = urllib.parse.urlparse(url)
+        params = urllib.parse.parse_qs(parsed.query)
+        goto_urls = params.get('gotoUrl', [])
+        if goto_urls:
+            goto_url = urllib.parse.unquote(goto_urls[0])
+            part_match = goto_url.rstrip('/').split('/')[-1]
+            if part_match:
+                return f"https://www.ti.com/lit/ds/symlink/{part_match}.pdf"
+    return url
+
+
+def download_pdf_with_requests(url, filepath, internal_pn=None):
+    url = resolve_ti_redirect(url)
+    if not url.lower().endswith('.pdf'):
+        time.sleep(5)
+    
+    user_agents = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.112 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5_2) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
+    ]
+    
+    user_agent = random.choice(user_agents)
+    headers = {
+        'User-Agent': user_agent,
+        'Accept': 'application/pdf,*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+    }
+    
+    session = requests.Session()
+    session.headers.update(headers)
+    
+    for attempt in range(MAX_ATTEMPTS):
+        try:
+            response = session.get(url, timeout=30, allow_redirects=True, stream=True, verify=True)
+            
+            if response.status_code == 200:
+                content = b''
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        content += chunk
+                
+                if len(content) > 1000 and content.startswith(b'%PDF'):
+                    with open(filepath, 'wb') as f:
+                        f.write(content)
+                    return True, "Downloaded successfully"
+                else:
+                    return False, "Invalid PDF content"
+            else:
+                if attempt < MAX_ATTEMPTS - 1:
+                    time.sleep(1)
+                    continue
+                return False, f"HTTP {response.status_code}"
+                
+        except Exception as e:
+            if attempt < MAX_ATTEMPTS - 1:
+                time.sleep(1)
+                continue
+            return False, f"Download error: {str(e)}"
+    
+    return False, "Failed after all attempts"
+
+
+def run_downloader(csv_file, status_callback=None, progress_callback=None, config=None, results_callback=None, worker_callback=None, should_stop=None):
+    from datetime import datetime
+    
+    global MAX_WORKERS, MAX_API_WORKERS, REQUESTS_PER_MINUTE, MAX_ATTEMPTS
+    
+    cfg = config or {}
+    max_workers = cfg.get("MAX_WORKERS", 5)
+    max_api_workers = cfg.get("MAX_API_WORKERS", 1)
+    requests_per_minute = cfg.get("REQUESTS_PER_MINUTE", 120)
+    max_attempts = cfg.get("MAX_ATTEMPTS", 3)
+    
+    MAX_WORKERS = max_workers
+    MAX_API_WORKERS = max_api_workers
+    REQUESTS_PER_MINUTE = requests_per_minute
+    MAX_ATTEMPTS = max_attempts
+    
+    api_keys = load_api_keys()
+    if not api_keys:
+        if status_callback:
+            status_callback("❌ No API keys found! Please configure api_keys.json\n")
+        return
+
+    # Load parts from CSV
     parts = []
     try:
-        with open(filename, 'r') as f:
+        with open(csv_file, 'r') as f:
             reader = csv.reader(f)
             next(reader)  # Skip header
             for row in reader:
                 if len(row) >= 3:
                     internal_pn, manufacturer, manufacturer_pn = row[0], row[1], row[2]
                     parts.append((internal_pn, manufacturer_pn, manufacturer))
-        logger.info(f"📋 Loaded {len(parts)} parts from {filename}")
-        return parts
-    except FileNotFoundError:
-        logger.error(f"❌ File {filename} not found!")
-        return []
     except Exception as e:
-        logger.error(f"❌ Error loading parts: {e}")
-        return []
-
-def save_results_to_csv(results, filename=None):
-    """Save results to CSV report, organized by status then internal P/N"""
-    os.makedirs("reports", exist_ok=True)
-
-    # Generate filename with current time if not provided
-    if filename is None:
-        now = datetime.now()
-        timestamp = now.strftime('%Y-%m-%d %H-%M-%S')
-        filename = f"reports/{timestamp}_report.csv"
-
-    # Define status priority for sorting (successful results first)
-    status_priority = {
-        'success': 1,
-        'skipped': 2,
-        'no_datasheet': 3,
-        'not_found': 4,
-        'download_failed': 5,
-        'error': 6,
-        'unknown': 7
-    }
-    # Sort results by status priority, then by internal P/N
-    def sort_key(result):
-        status = result.get('status', 'unknown')
-        # Handle skipped items as success
-        if result.get('skipped'):
-            status = 'success'
-        priority = status_priority.get(status, 7)
-        internal_pn = result.get('internal_pn', '').upper()  # Case-insensitive sort
-        return (priority, internal_pn)
-
-    sorted_results = sorted(results, key=sort_key)
-
-    with open(filename, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerow(["Status", "Internal P/N", "Manufacturer P/N", "Found Part", "Manufacturer", "Filename/URL", "Notes"])
-
-        for result in sorted_results:
-            status = result.get('status', 'unknown')
-            if result.get('skipped'):
-                status_text = 'Success'
-                notes = 'Downloaded'
-            elif status == 'success':
-                status_text = 'Success'
-                notes = 'Downloaded'
-            elif status == 'not_found':
-                status_text = 'Not Found'
-                notes = 'Part not found in DigiKey'
-            elif status == 'no_datasheet':
-                status_text = 'No Datasheet'
-                notes = 'No datasheet available'
-            elif status == 'download_failed':
-                status_text = 'Download Failed'
-                notes = result.get('error', 'Download failed')
-                # Clean up error message - remove extra newlines and normalize whitespace
-                notes = ' '.join(notes.split())
-            else:
-                status_text = 'Error'
-                notes = result.get('error', 'Unknown error')
-                # Clean up error message - remove extra newlines and normalize whitespace
-                notes = ' '.join(notes.split())
-
-            # Ensure URLs and filenames have spaces replaced with %20 for consistency
-            filename_or_url = result.get('filename', result.get('url', ''))
-            if filename_or_url:
-                filename_or_url = filename_or_url.replace(' ', '%20')
-                # Also rewrite onsemi.com to onsemi.cn in the report output
-                filename_or_url = filename_or_url.replace('onsemi.com', 'onsemi.cn')
-            writer.writerow([
-                status_text,
-                result.get('internal_pn', ''),
-                result.get('manufacturer_pn', ''),
-                result.get('found_part', ''),
-                result.get('manufacturer', ''),
-                filename_or_url,
-                notes
-            ])
-
-    logger.info(f"📄 Report saved: {filename}")
-
-def main():
-    """Main function to run the datasheet downloader"""
-    if len(sys.argv) < 2:
-        logger.error("❌ Usage: python script_new.py <parts_file.csv>")
-        sys.exit(1)
-
-    parts_file = sys.argv[1]
-
-    # Check API keys
-    if not API_KEYS:
-        logger.error("❌ No API keys found! Please configure api_keys.json")
-        sys.exit(1)
-
-    # Load parts
-    parts = load_parts_from_csv(parts_file)
-    if not parts:
-        logger.error("❌ No parts to process!")
-        sys.exit(1)
-
-    # Setup queues
-    parts_queue = queue.Queue()
-    download_queue = queue.Queue()
-    results_queue = queue.Queue()
-
-    # Add parts to queue
-    for part in parts:
-        parts_queue.put(part)
-
-    # Setup progress display
-
-    # Setup workers
-    api_workers = []
-    download_workers = []
-
-    # Create API workers
-    for i in range(MAX_API_WORKERS):
-        worker = APIWorker(
-            downloader=None,
-            download_queue=download_queue,
-            results_queue=results_queue,
-            api_key=API_KEYS[i % len(API_KEYS)],
-            worker_id=f"API-Worker-{i+1}"
-        )
-        worker.set_parts_queue(parts_queue)
-        api_workers.append(worker)
-
-    # Create download workers
-    for i in range(MAX_WORKERS):
-        worker = DownloadWorker(
-            download_queue=download_queue,
-            results_queue=results_queue,
-            worker_id=f"DL-Worker-{i+1}"
-        )
-        download_workers.append(worker)
-
-    # Start workers
-    logger.info("🚀 Starting datasheet downloader...")
-    logger.info(f"⚙️  Settings: {MAX_API_WORKERS} API workers + {MAX_WORKERS} download workers")
-
-    for worker in api_workers:
-        worker.start()
-
-    for worker in download_workers:
-        worker.start()
-
-    # Collect results
-    results = []
-    completed = 0
-    last_display = time.time()
-    try:
-        while completed < len(parts):
-            now = time.time()
-            try:
-                result = results_queue.get(timeout=1)
-                results.append(result)
-                completed += 1
-                last_display = now
-            except queue.Empty:
-                # Update display at least once per second
-                if now - last_display >= 1.0:
-                    last_display = now
-                continue
-            except KeyboardInterrupt:
-                logger.info("⏹️  Shutdown requested...")
-                break
-    except RateLimitExceeded:
-        logger.error("❌ Shutting down due to rate limit exceeded.")
-        for worker in api_workers:
-            worker.is_running = False
-        for worker in download_workers:
-            worker.is_running = False
-        return
-    except KeyboardInterrupt:
-        logger.info("⏹️  Shutdown requested...")
-    # Stop workers and save results on shutdown
-    try:
-        for worker in api_workers:
-            worker.stop()
-        for worker in download_workers:
-            worker.stop()
-    except KeyboardInterrupt:
-        print("\nShutdown interrupted. Exiting immediately.")
-        return
-    save_results_to_csv(results)
-    logger.info("✅ Complete!")
-
-import requests, os, json, time, random, threading, sys, csv, queue, logging, urllib3 
-from rich.console import Console, Group
-from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn, SpinnerColumn
-from rich.table import Table
-from rich.live import Live
-from datetime import datetime, timedelta
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-MAX_WORKERS = 5
-MAX_API_WORKERS = 1
-REQUESTS_PER_MINUTE = 120
-MAX_ATTEMPTS = 3
-LOGGING = True  # Enable logging to file
-
-API_KEYS = load_api_keys()
-
-def run_downloader(csv_file, status_callback=None, progress_callback=None, config=None, results_callback=None, worker_callback=None, should_stop=None):
-    global MAX_WORKERS, MAX_API_WORKERS, REQUESTS_PER_MINUTE, MAX_ATTEMPTS, LOGGING
-    """
-    Run the datasheet downloader, calling status_callback(msg) and progress_callback(completed, total) as appropriate.
-    Accepts config dict for settings, results_callback for table updates, worker_callback for worker status updates.
-    """
-    # Use config values if provided, else fallback to defaults
-    cfg = config or {}
-    max_workers = cfg.get("MAX_WORKERS", 5)
-    max_api_workers = cfg.get("MAX_API_WORKERS", 1)
-    requests_per_minute = cfg.get("REQUESTS_PER_MINUTE", 120)
-    max_attempts = cfg.get("MAX_ATTEMPTS", 3)
-    logging_enabled = cfg.get("LOGGING", True)
-    # Optionally set globals if needed (for legacy code)
-    MAX_WORKERS = max_workers
-    MAX_API_WORKERS = max_api_workers
-    REQUESTS_PER_MINUTE = requests_per_minute
-    MAX_ATTEMPTS = max_attempts
-    LOGGING = logging_enabled
-
-    # Setup logging handlers only when download starts
-    for handler in logging.root.handlers[:]:
-        logging.root.removeHandler(handler)
-    handlers = []
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setLevel(logging.INFO)
-    stream_handler.addFilter(MaxLevelFilter(logging.WARNING))
-    stream_handler.setFormatter(logging.Formatter('%(message)s'))
-    handlers.append(stream_handler)
-    if logging_enabled:  # Only add file handler if logging to file is enabled
-        os.makedirs('reports', exist_ok=True)
-        now = datetime.now()
-        timestamp = now.strftime('%Y-%m-%d %H-%M-%S')
-        log_filename = f'reports/{timestamp}_report.log'
-        file_handler = logging.FileHandler(log_filename, mode='w', encoding='utf-8')
-        file_handler.setLevel(logging.WARNING)
-        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-        handlers.append(file_handler)
-    logging.basicConfig(level=logging.INFO, handlers=handlers)
-
-    API_KEYS = load_api_keys()
-    if not API_KEYS:
         if status_callback:
-            status_callback("❌ No API keys found! Please configure api_keys.json\n")
+            status_callback(f"❌ Error loading parts: {e}\n")
         return
-    parts = load_parts_from_csv(csv_file)
+
     if not parts:
         if status_callback:
             status_callback(f"❌ No parts to process in {csv_file}!\n")
         return
+
     parts_queue = queue.Queue()
     download_queue = queue.Queue()
     results_queue = queue.Queue()
+    
     for part in parts:
         parts_queue.put(part)
 
-def run_downloader(csv_file, status_callback=None, progress_callback=None, config=None, results_callback=None, worker_callback=None, should_stop=None):
-    global MAX_WORKERS, MAX_API_WORKERS, REQUESTS_PER_MINUTE, MAX_ATTEMPTS, LOGGING
-    """
-    Run the datasheet downloader, calling status_callback(msg) and progress_callback(completed, total) as appropriate.
-    Accepts config dict for settings, results_callback for table updates, worker_callback for worker status updates.
-    should_stop: optional callable to signal early termination (for GUI thread interruption)
-    """
-    # Use config values if provided, else fallback to defaults
-    cfg = config or {}
-    max_workers = cfg.get("MAX_WORKERS", 5)
-    max_api_workers = cfg.get("MAX_API_WORKERS", 1)
-    requests_per_minute = cfg.get("REQUESTS_PER_MINUTE", 120)
-    max_attempts = cfg.get("MAX_ATTEMPTS", 3)
-    logging_enabled = cfg.get("LOGGING", True)
-    # Optionally set globals if needed (for legacy code)
-    MAX_WORKERS = max_workers
-    MAX_API_WORKERS = max_api_workers
-    REQUESTS_PER_MINUTE = requests_per_minute
-    MAX_ATTEMPTS = max_attempts
-    LOGGING = logging_enabled
-
-    # Setup logging handlers only when download starts
-    for handler in logging.root.handlers[:]:
-        logging.root.removeHandler(handler)
-    handlers = []
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setLevel(logging.INFO)
-    stream_handler.addFilter(MaxLevelFilter(logging.WARNING))
-    stream_handler.setFormatter(logging.Formatter('%(message)s'))
-    handlers.append(stream_handler)
-    if logging_enabled:  # Only add file handler if logging to file is enabled
-        os.makedirs('reports', exist_ok=True)
-        now = datetime.now()
-        timestamp = now.strftime('%Y-%m-%d %H-%M-%S')
-        log_filename = f'reports/{timestamp}_report.log'
-        file_handler = logging.FileHandler(log_filename, mode='w', encoding='utf-8')
-        file_handler.setLevel(logging.WARNING)
-        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-        handlers.append(file_handler)
-    logging.basicConfig(level=logging.INFO, handlers=handlers)
-
-    API_KEYS = load_api_keys()
-    if not API_KEYS:
-        if status_callback:
-            status_callback("❌ No API keys found! Please configure api_keys.json\n")
-        return
-    parts = load_parts_from_csv(csv_file)
-    if not parts:
-        if status_callback:
-            status_callback(f"❌ No parts to process in {csv_file}!\n")
-        return
-    parts_queue = queue.Queue()
-    download_queue = queue.Queue()
-    results_queue = queue.Queue()
-    for part in parts:
-        parts_queue.put(part)
     completed = 0
     total = len(parts)
-    # Progress object to track worker status
+
     class ProgressTracker:
         def __init__(self, worker_count, api_worker_count):
             self.worker_status = {i: "Idle" for i in range(worker_count)}
             self.api_worker_status = {i: "Idle" for i in range(api_worker_count)}
+
         def update_worker_status(self, worker_id, status, details):
-            # worker_id is like "DL-Worker-1" or "API-Worker-1"
-            print(f"DEBUG: update_worker_status called: {worker_id}, {status}, {details}")
             if worker_id.startswith("DL-Worker-"):
                 idx = int(worker_id.split("-")[-1]) - 1
                 self.worker_status[idx] = status if details == "" else f"{status} {details}"
             elif worker_id.startswith("API-Worker-"):
                 idx = int(worker_id.split("-")[-1]) - 1
                 self.api_worker_status[idx] = status if details == "" else f"{status} {details}"
+
         def get_all_status(self):
-            # Merge both dicts, API workers first, then DL workers
             merged = {}
             offset = 0
             for i in range(len(self.api_worker_status)):
@@ -887,23 +451,25 @@ def run_downloader(csv_file, status_callback=None, progress_callback=None, confi
             offset += len(self.api_worker_status)
             for i in range(len(self.worker_status)):
                 merged[offset + i] = self.worker_status[i]
-            print("[DEBUG] ProgressTracker.get_all_status returns:", merged)
             return dict(merged)
 
     progress_tracker = ProgressTracker(max_workers, max_api_workers)
+    
     api_workers = []
     download_workers = []
+    
     for i in range(max_api_workers):
         worker = APIWorker(
             downloader=None,
             download_queue=download_queue,
             results_queue=results_queue,
             progress=progress_tracker,
-            api_key=API_KEYS[i % len(API_KEYS)],
+            api_key=api_keys[i % len(api_keys)],
             worker_id=f"API-Worker-{i+1}"
         )
         worker.set_parts_queue(parts_queue)
         api_workers.append(worker)
+
     for i in range(max_workers):
         worker = DownloadWorker(
             download_queue=download_queue,
@@ -912,17 +478,19 @@ def run_downloader(csv_file, status_callback=None, progress_callback=None, confi
             worker_id=f"DL-Worker-{i+1}"
         )
         download_workers.append(worker)
+
     for worker in api_workers:
         worker.start()
     for worker in download_workers:
         worker.start()
+
     if status_callback:
         status_callback(f"🚀 Starting datasheet downloader...\n")
         status_callback(f"⚙️  Settings: {max_api_workers} API workers + {max_workers} download workers\n")
+
     results = []
-    # For table/worker updates
-    result_counts = {0:0, 1:0, 2:0, 3:0, 4:0, 5:0}  # Downloaded, Skipped, No datasheet, Not found, Download failed, Errors
-    worker_status = {}
+    result_counts = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+    
     try:
         last_worker_update = time.time()
         while completed < total:
@@ -930,10 +498,11 @@ def run_downloader(csv_file, status_callback=None, progress_callback=None, confi
             try:
                 if should_stop is not None and callable(should_stop) and should_stop():
                     raise KeyboardInterrupt
+                
                 result = results_queue.get(timeout=0.2)
                 results.append(result)
                 completed += 1
-                # Update result_counts for table
+                
                 status = result.get('status', '')
                 if result.get('skipped') or status == 'success':
                     result_counts[0] += 1
@@ -946,30 +515,27 @@ def run_downloader(csv_file, status_callback=None, progress_callback=None, confi
                 elif status == 'error':
                     result_counts[5] += 1
                 else:
-                    result_counts[1] += 1  # Skipped/other
+                    result_counts[1] += 1
+
                 if results_callback:
                     results_callback(result_counts.copy())
+
                 if progress_callback:
                     progress_callback(completed, total)
-                if worker_callback:
-                    debug_status = progress_tracker.get_all_status()
-                    print("[DEBUG] Sending worker status to GUI:", debug_status)
-                    worker_callback(debug_status)
-                if status_callback:
-                    status_callback(f"Downloaded: {completed}/{total} | Status: {result.get('status', 'unknown')}\n")
-            except queue.Empty:
-                # Periodically send worker status updates even if no result
+
                 if worker_callback and (now - last_worker_update > 0.5):
                     worker_callback(progress_tracker.get_all_status())
                     last_worker_update = now
-    except RateLimitExceeded:
-        if status_callback:
-            status_callback("❌ Shutting down due to rate limit exceeded.\n")
-        for worker in api_workers:
-            worker.is_running = False
-        for worker in download_workers:
-            worker.is_running = False
-        return
+
+                if status_callback:
+                    part_name = result.get('manufacturer_pn', 'Unknown')
+                    status_callback(f"Processed: {part_name} - {status}\n")
+
+            except queue.Empty:
+                if worker_callback and (now - last_worker_update > 0.5):
+                    worker_callback(progress_tracker.get_all_status())
+                    last_worker_update = now
+
     except KeyboardInterrupt:
         if status_callback:
             status_callback("⏹️  Shutdown requested...\n")
@@ -977,12 +543,16 @@ def run_downloader(csv_file, status_callback=None, progress_callback=None, confi
             worker.is_running = False
         for worker in download_workers:
             worker.is_running = False
+
     except Exception as e:
         if status_callback:
             status_callback(f"❌ Error: {e}\n")
+
+    # Clean shutdown
+    for worker in api_workers:
+        worker.stop()
+    for worker in download_workers:
+        worker.stop()
+
     if status_callback:
         status_callback("✅ Complete!\n")
-    save_results_to_csv(results)
-
-if __name__ == "__main__":
-    main()
