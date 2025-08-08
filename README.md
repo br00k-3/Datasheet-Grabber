@@ -13,7 +13,7 @@ A robust, multi-threaded Python tool for automatically searching, downloading, a
 - **Detailed CSV report**: Results are saved and sorted for easy review.
 
 ## Example
-<img width="702" height="532" alt="Screenshot 2025-08-07 164155" src="https://github.com/user-attachments/assets/fe64a795-ef64-48cf-a9b4-3d80677f1a78" />
+<img width="902" height="632" alt="Screenshot 2025-08-08 122333" src="https://github.com/user-attachments/assets/994a968d-ce2e-460f-b0c1-c7d9c96f5c88" />
 
 ## Setup
 
