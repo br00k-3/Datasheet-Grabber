@@ -2,10 +2,9 @@ import sys
 import json
 import os
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QLabel, QLineEdit, QPushButton, QProgressBar, 
-    QHBoxLayout, QVBoxLayout, QFileDialog, QTableWidget, QTableWidgetItem, 
-    QSizePolicy, QDialog, QFormLayout, QSpinBox, QCheckBox, QDialogButtonBox, 
-    QHeaderView, QTextEdit, QSplitter
+    QApplication, QWidget, QLabel, QLineEdit, QPushButton, QProgressBar, QHBoxLayout,
+    QVBoxLayout, QFileDialog, QTableWidget, QTableWidgetItem, QDialog, QFormLayout, 
+    QSpinBox, QCheckBox, QDialogButtonBox, QHeaderView, QTextEdit, QSplitter
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtGui import QIcon, QFont
@@ -413,7 +412,7 @@ class DatasheetGrabberGUI(QWidget):
         self.thread.finished.connect(self.download_finished)
         
         self.start_button.setText("Stop Download")
-        self.start_button.setStyleSheet("QPushButton { background-color: #ff4444; }")
+        self.start_button.setStyleSheet("QPushButton:hover { background-color: #ff4444; }")
         self.thread.start()
     
     def stop_download(self):

@@ -55,18 +55,16 @@ class APIWorker:
                     continue
                 
                 try:
-                    # Get part from queue with timeout
                     part_data = self.parts_queue.get(timeout=1.0)
                     internal_pn, manufacturer_pn, manufacturer = part_data
                     
                     if self.progress:
                         self.progress.update_worker_status(self.worker_id, "🔍 Searching", manufacturer_pn)
                     
-                    # Search for part
                     result = self.search_part(manufacturer_pn)
                     
                     if result.get('error'):
-                        # API error - put result directly to results queue
+                        logger.error(f"API error for {manufacturer_pn}: {result.get('message', '')}")
                         self.results_queue.put({
                             'internal_pn': internal_pn,
                             'manufacturer_pn': manufacturer_pn,
@@ -77,7 +75,6 @@ class APIWorker:
                             'file_path': ''
                         })
                     elif result.get('datasheet_url'):
-                        # Found datasheet - queue for download
                         download_task = {
                             'internal_pn': internal_pn,
                             'manufacturer_pn': manufacturer_pn,
@@ -87,7 +84,6 @@ class APIWorker:
                         }
                         self.download_queue.put(download_task)
                     else:
-                        # No datasheet found
                         self.results_queue.put({
                             'internal_pn': internal_pn,
                             'manufacturer_pn': manufacturer_pn,
@@ -133,7 +129,7 @@ class APIWorker:
                 token_data = response.json()
                 self.access_token = token_data['access_token']
                 expires_in = token_data.get('expires_in', 3600)
-                self.token_expiry = datetime.now() + timedelta(seconds=expires_in - 300)  # 5 min buffer
+                self.token_expiry = datetime.now() + timedelta(seconds=expires_in - 300) # 5 min buffer
                 return True
             elif response.status_code == 429:
                 raise RateLimitExceeded()
@@ -257,8 +253,31 @@ class DownloadWorker:
                     # Create directory if needed
                     os.makedirs("datasheets", exist_ok=True)
                     
+                    # Check if file already exists
+                    if os.path.exists(filepath):
+                        msg = f"File already exists for {manufacturer_pn}, skipping"
+                        logger.info(msg)  # Changed from warning to info
+                        result = {
+                            'internal_pn': internal_pn,
+                            'manufacturer_pn': manufacturer_pn,
+                            'manufacturer': manufacturer,
+                            'status': 'skipped',
+                            'message': 'File already exists',
+                            'datasheet_url': datasheet_url,
+                            'file_path': filepath
+                        }
+                        self.results_queue.put(result)
+                        self.download_queue.task_done()
+                        if self.progress:
+                            self.progress.update_worker_status(self.worker_id, "⏭️ Skipped", "")
+                        continue
+                    
                     # Download the file
                     success, message = download_pdf_with_requests(datasheet_url, filepath, internal_pn)
+                    
+                    # Log failed download
+                    if not success:
+                        logger.error(f"Download failed for {manufacturer_pn}: {message}")
                     
                     # Put result
                     result = {
@@ -328,6 +347,10 @@ def resolve_ti_redirect(url):
 
 def download_pdf_with_requests(url, filepath, internal_pn=None):
     url = resolve_ti_redirect(url)
+    # Reformat URLs starting with //mm to https:/mm
+    if url.startswith('//mm'):
+        url = 'https:/' + url[1:]
+    
     if not url.lower().endswith('.pdf'):
         time.sleep(5)
     
@@ -380,19 +403,30 @@ def download_pdf_with_requests(url, filepath, internal_pn=None):
 
 def run_downloader(csv_file, status_callback=None, progress_callback=None, config=None, results_callback=None, worker_callback=None, should_stop=None):
     from datetime import datetime
-    
     global MAX_WORKERS, MAX_API_WORKERS, REQUESTS_PER_MINUTE, MAX_ATTEMPTS
-    
+    # Prepare reports folder
+    os.makedirs("reports", exist_ok=True)
+    # Timestamp for this run
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Set up logging if enabled - BEFORE workers start
+    log_file = None
     cfg = config or {}
-    max_workers = cfg.get("MAX_WORKERS", 5)
-    max_api_workers = cfg.get("MAX_API_WORKERS", 1)
-    requests_per_minute = cfg.get("REQUESTS_PER_MINUTE", 120)
-    max_attempts = cfg.get("MAX_ATTEMPTS", 3)
-    
-    MAX_WORKERS = max_workers
-    MAX_API_WORKERS = max_api_workers
-    REQUESTS_PER_MINUTE = requests_per_minute
-    MAX_ATTEMPTS = max_attempts
+    if cfg.get("LOGGING", True):
+        log_file = os.path.join("reports", f"report_{timestamp}.log")
+        logging.basicConfig(
+            filename=log_file,
+            filemode='w',
+            format='%(asctime)s [%(levelname)s] %(message)s',
+            level=logging.WARNING
+        )
+        logger.setLevel(logging.WARNING)
+        if status_callback:
+            status_callback(f"📝 Logging warnings/errors to {log_file}\n")
+
+    MAX_WORKERS = cfg.get("MAX_WORKERS", 5)
+    MAX_API_WORKERS = cfg.get("MAX_API_WORKERS", 1)
+    REQUESTS_PER_MINUTE = cfg.get("REQUESTS_PER_MINUTE", 120)
+    MAX_ATTEMPTS = cfg.get("MAX_ATTEMPTS", 3)
     
     api_keys = load_api_keys()
     if not api_keys:
@@ -453,12 +487,12 @@ def run_downloader(csv_file, status_callback=None, progress_callback=None, confi
                 merged[offset + i] = self.worker_status[i]
             return dict(merged)
 
-    progress_tracker = ProgressTracker(max_workers, max_api_workers)
+    progress_tracker = ProgressTracker(MAX_WORKERS, MAX_API_WORKERS)
     
     api_workers = []
     download_workers = []
     
-    for i in range(max_api_workers):
+    for i in range(MAX_API_WORKERS):
         worker = APIWorker(
             downloader=None,
             download_queue=download_queue,
@@ -470,7 +504,7 @@ def run_downloader(csv_file, status_callback=None, progress_callback=None, confi
         worker.set_parts_queue(parts_queue)
         api_workers.append(worker)
 
-    for i in range(max_workers):
+    for i in range(MAX_WORKERS):
         worker = DownloadWorker(
             download_queue=download_queue,
             results_queue=results_queue,
@@ -486,7 +520,7 @@ def run_downloader(csv_file, status_callback=None, progress_callback=None, confi
 
     if status_callback:
         status_callback(f"🚀 Starting datasheet downloader...\n")
-        status_callback(f"⚙️  Settings: {max_api_workers} API workers + {max_workers} download workers\n")
+        status_callback(f"⚙️  Settings: {MAX_API_WORKERS} API workers + {MAX_WORKERS} download workers\n")
 
     results = []
     result_counts = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
@@ -548,11 +582,44 @@ def run_downloader(csv_file, status_callback=None, progress_callback=None, confi
         if status_callback:
             status_callback(f"❌ Error: {e}\n")
 
-    # Clean shutdown
+        # Clean shutdown
     for worker in api_workers:
         worker.stop()
     for worker in download_workers:
         worker.stop()
+
+    # Ensure reports directory exists
+    os.makedirs("reports", exist_ok=True)
+
+    # Save final results to CSV
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_file = os.path.join("reports", f"report_{timestamp}.csv")
+    try:
+        # Sort results by status - define custom order
+        status_order = {
+            'success': 0,      # Downloaded successfully
+            'skipped': 1,      # Already exists
+            'no_datasheet': 2, # No datasheet available
+            'not_found': 3,    # Part not found
+            'download_failed': 4, # Download failed
+            'error': 5         # API or other errors
+        }
+        
+        # Sort the results list
+        sorted_results = sorted(results, key=lambda x: status_order.get(x.get('status', ''), 999))
+        
+        with open(report_file, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                "internal_pn", "manufacturer_pn", "manufacturer",
+                "status", "message", "datasheet_url", "file_path"
+            ])
+            writer.writeheader()
+            writer.writerows(sorted_results)  # Write sorted results instead
+        if status_callback:
+            status_callback(f"💾 Results saved to {report_file}\n")
+    except Exception as e:
+        if status_callback:
+            status_callback(f"❌ Failed to save results: {e}\n")
 
     if status_callback:
         status_callback("✅ Complete!\n")
